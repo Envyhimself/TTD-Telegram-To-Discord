@@ -23,7 +23,13 @@ const c = process.stdout.isTTY ? {
 
 const line = () => console.log(c.dim('─'.repeat(62)));
 
-const rl = createInterface({ input: process.stdin, terminal: !!process.stdout.isTTY });
+// caxa launches the wizard through a child process on Windows, where stdout.isTTY
+// may be false even in a visible console. Force terminal mode so typed input echoes.
+const rl = createInterface({
+  input: process.stdin,
+  output: process.stdout,
+  terminal: process.platform === 'win32' || Boolean(process.stdout.isTTY)
+});
 function askQ(question, def = '') {
   return new Promise(resolve => {
     rl.question(c.b(question) + (def ? c.dim(` [${def}]`) : '') + ' ', answer => {
