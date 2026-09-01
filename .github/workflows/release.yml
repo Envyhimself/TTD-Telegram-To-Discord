@@ -15,12 +15,8 @@ jobs:
         include:
           - os: windows-latest
             asset: telegram-wizard-windows-x64.exe
-            node_url: https://nodejs.org/dist/v22.14.0/node-v22.14.0-win-x64.exe
-            node_exe: node.exe
           - os: ubuntu-latest
             asset: telegram-wizard-linux-x64
-            node_url: https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz
-            node_exe: node
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -31,23 +27,18 @@ jobs:
         run: npm install
       - name: Self-test
         run: node wizard.js --selftest
-      - name: Make SEA blob
-        run: node --experimental-sea-config sea-config.json
-      - name: Build ${{ matrix.asset }} (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Build standalone ${{ matrix.asset }}
+        shell: bash
         run: |
-          Invoke-WebRequest ${{ matrix.node_url }} -OutFile node.exe
-          Copy-Item node.exe ${{ matrix.asset }}
-          npx --yes postject inject ${{ matrix.asset }} NODE_SEA_BLOB sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --overwrite
-      - name: Build ${{ matrix.asset }} (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          curl -fsSL ${{ matrix.node_url }} -o node.tar.xz
-          tar -xJf node.tar.xz
-          cp node-v22.14.0-linux-x64/bin/node ${{ matrix.asset }}
-          chmod +x ${{ matrix.asset }}
-          npx --yes postject inject ${{ matrix.asset }} NODE_SEA_BLOB sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --overwrite
+          STAGE="${{ runner.temp }}/ttd-stage"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          cp wizard.js package.json package-lock.json "$STAGE/"
+          cp -r src "$STAGE/"
+          cp -r node_modules "$STAGE/"
+          npx --yes caxa --input "$STAGE" --output "${{ matrix.asset }}" -- node "{{caxa}}/wizard.js"
+      - name: Smoke-test binary
+        shell: bash
+        run: ./${{ matrix.asset }} --selftest
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

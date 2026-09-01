@@ -156,7 +156,7 @@ if (process.argv.includes('--selftest')) {
 
 async function main() {
   line();
-  console.log(c.cyan.b('  Telegram → Discord relay  ·  Cloudflare Workers setup wizard'));
+  console.log(c.b(c.cyan('  Telegram → Discord relay  ·  Cloudflare Workers setup wizard')));
   line();
   console.log(`
 This wizard will:
@@ -282,7 +282,7 @@ id = "${kvId}"
   } catch (e) { summary = String(e.message); }
 
   line();
-  console.log(c.green.b('  ✅  All done!\n'));
+  console.log(c.b(c.green('  ✅  All done!\n')));
   console.log(`  Worker:  ${c.b(url)}`);
   console.log(`  Sync:    ${c.dim('automatic, every minute — only your selected channels are forwarded')}`);
   console.log(`  Test:    ${c.dim('open ' + url + '/test anytime to force a sync')}`);
