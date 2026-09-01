@@ -95,9 +95,10 @@ async function chooseChannels() {
 if (process.argv.includes('--selftest')) {
   const assert = (cond, msg) => { if (!cond) { console.error('FAIL: ' + msg); process.exit(1); } };
   const list = parseChannelList('warroom, @News_Hut  news_hut my_channel');
-  assert(list.length === 2, 'dedupe');
+  assert(list.length === 3, 'dedupe');
   assert(list[0].handle === 'warroom' && list[0].name === 'Warroom', 'pretty name');
-  assert(list[1].handle === 'my_channel' && list[1].name === 'My Channel', 'underscore split');
+  assert(list[1].handle === 'news_hut' && list[1].name === 'News Hut', 'deduped handle');
+  assert(list[2].handle === 'my_channel' && list[2].name === 'My Channel', 'underscore split');
   assert(parseChannelList('').length === 0, 'empty input -> empty list');
   assert(parseChannelList('  ').length === 0, 'blank input -> empty list');
   console.log('wizard selftest OK');
