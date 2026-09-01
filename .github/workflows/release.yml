@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            asset: telegram-wizard-windows-x64.exe
+            node_url: https://nodejs.org/dist/v22.14.0/node-v22.14.0-win-x64.exe
+            node_exe: node.exe
+          - os: ubuntu-latest
+            asset: telegram-wizard-linux-x64
+            node_url: https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz
+            node_exe: node
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install deps
+        run: npm install
+      - name: Self-test
+        run: node wizard.js --selftest
+      - name: Make SEA blob
+        run: node --experimental-sea-config sea-config.json
+      - name: Build ${{ matrix.asset }} (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest ${{ matrix.node_url }} -OutFile node.exe
+          Copy-Item node.exe ${{ matrix.asset }}
+          npx --yes postject inject ${{ matrix.asset }} NODE_SEA_BLOB sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --overwrite
+      - name: Build ${{ matrix.asset }} (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL ${{ matrix.node_url }} -o node.tar.xz
+          tar -xJf node.tar.xz
+          cp node-v22.14.0-linux-x64/bin/node ${{ matrix.asset }}
+          chmod +x ${{ matrix.asset }}
+          npx --yes postject inject ${{ matrix.asset }} NODE_SEA_BLOB sea-prep.blob --sentinel-fuse NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2 --overwrite
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
