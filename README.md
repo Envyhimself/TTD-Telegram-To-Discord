@@ -11,9 +11,17 @@ Telegram channel  ──▶  Cloudflare Worker (cron, every minute)  ──▶  
 
 Because the Worker fetches Telegram from Cloudflare's network, it keeps working even on networks where Telegram is blocked.
 
-## ⚡ Install (wizard)
+## ⚡ Install
 
-Requires [Node.js 18+](https://nodejs.org) only.
+**Option A — standalone executable (no Node.js needed):**
+
+Download from [Releases](https://github.com/Miizuim/telegram-to-discord/releases):
+- `telegram-wizard-windows-x64.exe` (Windows)
+- `telegram-wizard-linux-x64` (Linux)
+
+Put it in an empty folder and run it — it unpacks the whole project there and starts the setup wizard immediately.
+
+**Option B — from source** (requires [Node.js 18+](https://nodejs.org)):
 
 ```bash
 git clone https://github.com/<you>/telegram-to-discord.git
