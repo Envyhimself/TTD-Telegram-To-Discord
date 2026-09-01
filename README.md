@@ -4,9 +4,9 @@ Mirror public Telegram channels into a Discord text channel — automatically, f
 
 ```
 Telegram channel  ──▶  Cloudflare Worker (cron, every minute)  ──▶  Discord webhook
-   @warroom              fetch + parse + dedupe (KV)              text + media embeds
-   @fighter_radar
-   @news_hut
+   @Example             fetch + parse + dedupe (KV)                   text + media embeds
+   @Example
+   @Example
 ```
 
 Because the Worker fetches Telegram from Cloudflare's network, it keeps working even on networks where Telegram is blocked.
