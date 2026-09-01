@@ -15,5 +15,7 @@ jobs:
           node-version: 22
       - name: Install dependencies
         run: npm install
+      - name: Wizard self-test (selection logic)
+        run: node wizard.js --selftest
       - name: Validate Worker build
         run: npx wrangler deploy --dry-run

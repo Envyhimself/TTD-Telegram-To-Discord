@@ -56,9 +56,13 @@ That URL is the only credential this project needs.
 
 ## Managing channels
 
+Re-run the wizard — it shows a **recommended channels** menu (pick by number, ranges, `all`, or `none`) plus a field for your own handles, previews the final list, and rewrites `src/channels.js`:
+
 ```bash
-node wizard.js            # re-run, or edit src/channels.js directly:
+node wizard.js
 ```
+
+Or edit `src/channels.js` directly:
 
 ```js
 export const CHANNELS = [
@@ -67,7 +71,7 @@ export const CHANNELS = [
 ];
 ```
 
-Then `npx wrangler deploy`. Each channel keeps its own dedupe cursor, so adding one never replays history — it starts with its single newest post and follows from there.
+The recommended list lives in the `RECOMMENDED` array at the top of `wizard.js` — add your favorite channels there once, and every future install gets them as suggestions.
 
 ## Operations
 
