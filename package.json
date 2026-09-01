@@ -1,0 +1,15 @@
+{
+  "name": "telegram-to-discord-worker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "node-html-parser": "^6.1.13"
+  },
+  "devDependencies": {
+    "wrangler": "^3.100.0"
+  }
+}

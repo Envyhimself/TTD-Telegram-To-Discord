@@ -1,0 +1,10 @@
+name = "telegram-to-discord"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[kv_namespaces]]
+binding = "STATE_KV"
+id = "6df0f2cc6e214942942c8e57aee701e2"
