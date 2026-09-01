@@ -10,7 +10,9 @@
  *         node wizard.js --selftest   (non-interactive logic check, used by CI)
  */
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { writeFileSync, existsSync, mkdirSync, copyFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 
 const c = process.stdout.isTTY ? {
@@ -43,26 +45,45 @@ function run(cmd, args) {
   return { ok: r.status === 0, out: (r.stdout || '') + (r.stderr || ''), status: r.status };
 }
 
-const die = msg => { console.error('\n' + c.red('✖ ' + msg)); rl.close(); process.exit(1); };
-
-// ── standalone exe: materialize the embedded project before anything else ──
-try {
-  const sea = await import('node:sea');
-  if (sea.isSea()) {
-    const ASSETS = ['src/index.js', 'src/telegram.js', 'src/discord.js', 'package.json'];
-    let extracted = 0;
-    for (const key of ASSETS) {
-      if (existsSync(key)) continue;
-      const { mkdirSync } = await import('node:fs');
-      mkdirSync(key.split('/').slice(0, -1).join('/'), { recursive: true });
-      writeFileSync(key, Buffer.from(sea.getRawAsset(key)));
-      extracted++;
-    }
-    console.log(extracted > 0
-      ? c.green('✔') + ` Project files materialized (${extracted})`
-      : c.dim('Project files already present — reusing them'));
+const waitForExit = () => {
+  if (process.platform === 'win32' && process.stdin.isTTY) {
+    spawnSync('cmd.exe', ['/c', 'pause'], { stdio: 'inherit' });
   }
-} catch { /* running as plain `node wizard.js` — project files are already on disk */ }
+};
+
+const die = msg => {
+  console.error('\n' + c.red('✖ ' + msg));
+  rl.close();
+  waitForExit();
+  process.exit(1);
+};
+
+// caxa runs wizard.js from an extracted internal directory. Copy the embedded
+// project into the user's current folder so Wrangler/npm have real source files.
+function materializeProject() {
+  const bundledRoot = dirname(fileURLToPath(import.meta.url));
+  const cwd = process.cwd();
+  const files = [
+    'package.json',
+    'package-lock.json',
+    'src/index.js',
+    'src/telegram.js',
+    'src/discord.js'
+  ];
+  let copied = 0;
+  for (const rel of files) {
+    const source = join(bundledRoot, rel);
+    const target = join(cwd, rel);
+    if (existsSync(target)) continue;
+    if (!existsSync(source)) throw new Error(`Packaged file missing: ${rel}`);
+    mkdirSync(dirname(target), { recursive: true });
+    copyFileSync(source, target);
+    copied++;
+  }
+  if (copied) console.log(c.green('✔') + ` Project files created in ${cwd}`);
+}
+
+materializeProject();
 
 // ── channel selection ───────────────────────────────────────────────────────
 
