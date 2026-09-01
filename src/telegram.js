@@ -18,15 +18,28 @@ export function extractImages(node) {
     const u = extractBackgroundUrl(photo.getAttribute('style'));
     if (u) images.push(u);
   }
-  for (const vt of node.querySelectorAll('.tgme_widget_message_video_thumb')) {
-    const u = extractBackgroundUrl(vt.getAttribute('style'));
-    if (u) images.push(u);
+  // Only use video thumbnails when Telegram does not expose a playable video.
+  if (node.querySelectorAll('video[src]').length === 0) {
+    for (const vt of node.querySelectorAll('.tgme_widget_message_video_thumb')) {
+      const u = extractBackgroundUrl(vt.getAttribute('style'));
+      if (u) images.push(u);
+    }
+    for (const v of node.querySelectorAll('video[poster]')) {
+      const u = v.getAttribute('poster');
+      if (u) images.push(u);
+    }
   }
-  for (const v of node.querySelectorAll('video[poster]')) {
-    const u = v.getAttribute('poster');
-    if (u) images.push(u);
+  return [...new Set(images)];
+}
+
+export function extractVideos(node) {
+  const videos = [];
+  for (const video of node.querySelectorAll('video[src]')) {
+    const url = video.getAttribute('src');
+    const poster = video.getAttribute('poster') || null;
+    if (url) videos.push({ url, poster });
   }
-  return images;
+  return videos.filter((v, i, all) => all.findIndex(x => x.url === v.url) === i);
 }
 
 // Convert Telegram preview HTML into Discord markdown
@@ -75,7 +88,8 @@ export async function fetchChannelMessages(handle) {
     const textNode = node.querySelector('.tgme_widget_message_text') || node.querySelector('.js-message_text');
     const text = textNode ? htmlToDiscord(textNode.innerHTML || '') : '';
     const images = extractImages(node);
-    messages.push({ id, text, images, hasContent: !!(text || images.length) });
+    const videos = extractVideos(node);
+    messages.push({ id, text, images, videos, hasContent: !!(text || images.length || videos.length) });
   }
   messages.sort((a, b) => a.id - b.id);
   return messages;

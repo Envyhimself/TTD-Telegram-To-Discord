@@ -1,6 +1,7 @@
 import { CHANNELS, fetchChannelMessages } from './telegram.js';
 
 const DISCORD_WEBHOOK_MAX_EMBEDS = 4;
+const DISCORD_MAX_UPLOAD_BYTES = 24 * 1024 * 1024; // 24 MB safe margin under Discord's 25 MB limit
 
 export default {
   // Cron Trigger - runs automatically every 1 minute
@@ -29,7 +30,6 @@ async function syncAllChannels(env) {
     return { error: 'DISCORD_WEBHOOK_URL environment variable is not configured.' };
   }
 
-  // Sync every channel independently - one failing must not block the others
   const results = [];
   for (const channel of CHANNELS) {
     try {
@@ -44,8 +44,6 @@ async function syncAllChannels(env) {
 async function syncChannel(channel, env, webhookUrl) {
   const messages = await fetchChannelMessages(channel.handle);
 
-  // Per-channel deduplication cursor in KV.
-  // Legacy fallback: warroom's old single global key keeps history intact.
   const kvKey = `last_seen:${channel.handle}`;
   let lastSeenId = 0;
   if (env.STATE_KV) {
@@ -58,7 +56,6 @@ async function syncChannel(channel, env, webhookUrl) {
 
   let newMessages;
   if (lastSeenId === 0) {
-    // First run for this channel: seed with the newest message that has content
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].hasContent) { newMessages = [messages[i]]; break; }
     }
@@ -73,10 +70,10 @@ async function syncChannel(channel, env, webhookUrl) {
   let cursor = lastSeenId;
   const postedIds = [];
   const skippedIds = [];
+  const failedIds = [];
 
   for (const msg of newMessages) {
     if (!msg.hasContent) {
-      // Empty payload would be rejected by Discord - advance past it silently
       skippedIds.push(msg.id);
       cursor = Math.max(cursor, msg.id);
       continue;
@@ -85,25 +82,69 @@ async function syncChannel(channel, env, webhookUrl) {
     if (outcome === 'posted') {
       cursor = Math.max(cursor, msg.id);
       postedIds.push(msg.id);
+      continue;
     }
-    // 'failed' -> cursor not advanced; it will retry next tick
+    // Preserve ordering: never advance past a failed video/message.
+    failedIds.push(msg.id);
+    break;
   }
 
   if (env.STATE_KV && cursor > lastSeenId) {
     await env.STATE_KV.put(kvKey, cursor.toString());
   }
 
-  return { channel: channel.handle, status: 'ok', postedCount: postedIds.length, postedIds, skippedIds, cursor };
+  return { channel: channel.handle, status: failedIds.length ? 'partial' : 'ok', postedCount: postedIds.length, postedIds, skippedIds, failedIds, cursor };
 }
 
 async function postToWebhook(webhookUrl, channelName, msg) {
-  let content = msg.text;
-  if (content.length > 2000) {
-    content = content.substring(0, 1995) + '...';
+  let content = msg.text || '';
+  if (content.length > 2000) content = content.substring(0, 1995) + '...';
+
+  const videos = (msg.videos || []).slice(0, 4);
+
+  // Video posts must deliver the actual MP4. Never silently replace them with thumbnails.
+  if (videos.length > 0) {
+    const files = [];
+    let totalBytes = 0;
+
+    try {
+      for (let i = 0; i < videos.length; i++) {
+        const vidRes = await fetch(videos[i].url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+        if (!vidRes.ok) {
+          console.error(`Telegram video fetch failed: HTTP ${vidRes.status} (post ${msg.id})`);
+          return 'failed';
+        }
+        const buf = await vidRes.arrayBuffer();
+        totalBytes += buf.byteLength;
+        if (buf.byteLength === 0 || totalBytes > DISCORD_MAX_UPLOAD_BYTES) {
+          console.error(`Video post ${msg.id} is empty or exceeds Discord's upload limit (${totalBytes} bytes)`);
+          return 'failed';
+        }
+        files.push(new Blob([buf], { type: 'video/mp4' }));
+      }
+
+      const form = new FormData();
+      form.append('payload_json', JSON.stringify({
+        username: channelName,
+        avatar_url: 'https://telegram.org/img/t_logo.png',
+        content: content || undefined,
+        attachments: files.map((_, i) => ({ id: i, filename: `video_${msg.id}_${i + 1}.mp4` }))
+      }));
+      files.forEach((blob, i) => form.append(`files[${i}]`, blob, `video_${msg.id}_${i + 1}.mp4`));
+
+      const res = await fetch(webhookUrl, { method: 'POST', body: form });
+      if (res.ok || res.status === 204) return 'posted';
+      console.error(`Discord rejected video upload (HTTP ${res.status}):`, await res.text());
+      return 'failed';
+    } catch (err) {
+      console.error(`Real video delivery failed for post ${msg.id}:`, err);
+      return 'failed';
+    }
   }
 
-  const embeds = (msg.images || []).map(imgUrl => ({ image: { url: imgUrl } })).slice(0, DISCORD_WEBHOOK_MAX_EMBEDS);
-
+  // Non-video posts: normal text + image embeds.
+  const embeds = (msg.images || []).slice(0, DISCORD_WEBHOOK_MAX_EMBEDS)
+    .map(imgUrl => ({ image: { url: imgUrl } }));
   if (!content && embeds.length === 0) return 'empty';
 
   const payload = {

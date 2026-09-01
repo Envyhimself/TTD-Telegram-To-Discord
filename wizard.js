@@ -60,45 +60,13 @@ try {
 
 // ── channel selection ───────────────────────────────────────────────────────
 
-// Curated suggestions shown by the wizard. Edit this list freely.
-const RECOMMENDED = [
-  { handle: 'warroom',       name: 'WARROOM News',    about: 'war & geopolitics (FA)' },
-  { handle: 'fighter_radar', name: 'Fighter Radar',   about: 'military & OSINT (FA)' },
-  { handle: 'news_hut',      name: 'News Hut',        about: 'news digest (FA)' },
-  { handle: 'telegram',      name: 'Telegram Tips',   about: 'official Telegram channel (EN)' },
-  { handle: 'durov',         name: "Durov's Channel", about: 'Telegram founder (EN)' }
-];
-
 const pretty = h => h.split(/[_\s-]+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 
-// Parse a menu selection like "1, 3-4", "all", "none" into sorted valid indices (1-based).
-export function parseSelection(input, max, defaultSel) {
-  const s = String(input || '').trim().toLowerCase();
-  if (!s) return [...defaultSel];
-  if (s === 'all') return Array.from({ length: max }, (_, i) => i + 1);
-  if (s === 'none') return [];
-  const out = new Set();
-  for (const part of s.split(/[,;\s]+/).filter(Boolean)) {
-    const range = part.match(/^(\d+)-(\d+)$/);
-    if (range) {
-      for (let i = +range[1]; i <= +range[2]; i++) if (i >= 1 && i <= max) out.add(i);
-    } else if (/^\d+$/.test(part)) {
-      const i = parseInt(part, 10);
-      if (i >= 1 && i <= max) out.add(i);
-    }
-  }
-  return [...out].sort((a, b) => a - b);
-}
-
-// Merge recommended picks + custom handles into the final CHANNELS list (deduped).
-export function buildChannelList(recommended, pickedIndices, customHandles) {
+// Parse pasted handles ("warroom, @News_Hut  my_news") into a deduped CHANNELS list.
+export function parseChannelList(raw) {
   const byHandle = new Map();
-  for (const i of pickedIndices) {
-    const ch = recommended[i - 1];
-    if (ch) byHandle.set(ch.handle, { handle: ch.handle, name: ch.name });
-  }
-  for (const raw of customHandles) {
-    const h = String(raw).trim().replace(/^@/, '').toLowerCase();
+  for (const part of String(raw || '').split(/[,;\s]+/).filter(Boolean)) {
+    const h = part.replace(/^@/, '').toLowerCase();
     if (h && !byHandle.has(h)) byHandle.set(h, { handle: h, name: pretty(h) });
   }
   return [...byHandle.values()];
@@ -108,24 +76,13 @@ async function chooseChannels() {
   while (true) {
     line();
     console.log(c.b('Which Telegram channels do you want forwarded to Discord?'));
-    console.log(c.dim('You pick everything — nothing is selected by default.\n'));
-    console.log(c.dim('Suggestions (optional) — add by number, e.g. "1,3" or "2-4" · "all" · Enter to skip:\n'));
-    RECOMMENDED.forEach((r, i) => {
-      console.log(`  ${c.b(`[${i + 1}]`)} ${r.name.padEnd(16)} ${c.dim('@' + r.handle + ' — ' + r.about)}`);
-    });
-    const selRaw = await askQ('Pick suggestions (or Enter to skip)', '');
-    const picked = parseSelection(selRaw, RECOMMENDED.length, []);
-
-    console.log('');
-    const customRaw = await askQ('Your own channels (comma-separated handles, e.g. warroom, my_news)');
-    const custom = customRaw.split(',').map(s => s.trim()).filter(Boolean);
-
-    const CHANNELS = buildChannelList(RECOMMENDED, picked, custom);
+    console.log(c.dim('Paste the handles yourself, comma-separated (e.g. warroom, my_news)\n'));
+    const raw = await askQ('Channels');
+    const CHANNELS = parseChannelList(raw);
     if (CHANNELS.length === 0) {
-      console.log(c.red('✖ No channels selected — pick suggestions, or type the handles you want.'));
+      console.log(c.red('✖ Paste at least one channel handle.'));
       continue;
     }
-
     console.log('\n' + c.b('Will forward from:'));
     CHANNELS.forEach(ch => console.log(`  ${c.green('•')} ${ch.name} ${c.dim('@' + ch.handle)}`));
     const ok = await askQ('Looks good? [Y/n]', 'Y');
@@ -137,17 +94,12 @@ async function chooseChannels() {
 // Self-test: `node wizard.js --selftest` (used by CI)
 if (process.argv.includes('--selftest')) {
   const assert = (cond, msg) => { if (!cond) { console.error('FAIL: ' + msg); process.exit(1); } };
-  assert(JSON.stringify(parseSelection('1, 3', 5, [])) === '[1,3]', 'numbers');
-  assert(JSON.stringify(parseSelection('2-4', 5, [])) === '[2,3,4]', 'ranges');
-  assert(JSON.stringify(parseSelection('all', 3, [])) === '[1,2,3]', 'all');
-  assert(JSON.stringify(parseSelection('none', 3, [])) === '[]', 'none');
-  assert(JSON.stringify(parseSelection('', 5, [2])) === '[2]', 'default on empty');
-  assert(JSON.stringify(parseSelection('', 5, [])) === '[]', 'wizard default: no channels pre-selected');
-  assert(JSON.stringify(parseSelection('0, 9, x, 3', 5, [])) === '[3]', 'invalid ignored');
-  const ch = buildChannelList(RECOMMENDED, [1], ['@warroom', 'my_channel']);
-  assert(ch.length === 2 && ch[0].handle === 'warroom' && ch[1].handle === 'my_channel' && ch[1].name === 'My Channel', 'dedupe + pretty');
-  const chCustomDupes = buildChannelList(RECOMMENDED, [], ['@News_Hut', 'NEWS_HUT']);
-  assert(chCustomDupes.length === 1 && chCustomDupes[0].handle === 'news_hut', 'custom dedupe case-insensitive');
+  const list = parseChannelList('warroom, @News_Hut  news_hut my_channel');
+  assert(list.length === 2, 'dedupe');
+  assert(list[0].handle === 'warroom' && list[0].name === 'Warroom', 'pretty name');
+  assert(list[1].handle === 'my_channel' && list[1].name === 'My Channel', 'underscore split');
+  assert(parseChannelList('').length === 0, 'empty input -> empty list');
+  assert(parseChannelList('  ').length === 0, 'blank input -> empty list');
   console.log('wizard selftest OK');
   process.exit(0);
 }
