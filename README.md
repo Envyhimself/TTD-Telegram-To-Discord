@@ -32,12 +32,15 @@ node wizard.js
 
 The wizard walks you through everything and is **safe to re-run**:
 
-1. installs dependencies
-2. picks the Telegram channels to mirror (defaults included)
-3. validates your Discord webhook (and posts a test message — skippable on blocked networks)
-4. logs you in to Cloudflare (browser popup, once)
-5. creates the KV namespace, writes `wrangler.toml`, and deploys
-6. stores the webhook as an encrypted secret and runs a first live sync
+1. chooses a unique Worker name — use a different one for every relay on the same Cloudflare account
+2. asks you to paste exactly which Telegram channels to forward (nothing pre-selected)
+3. installs dependencies
+4. validates your Discord webhook (test message; skippable on blocked networks)
+5. logs you in to Cloudflare (browser popup, once)
+6. creates a separate KV namespace, deploys that named Worker, and stores its webhook secret
+7. runs a first live sync
+
+Each name creates an independent Worker, KV cursor store, cron trigger, secret scope, and `workers.dev` URL. For multiple relays, run the wizard from a separate empty folder for each installation and choose a new name.
 
 When it finishes, your channel starts receiving posts — done.
 
