@@ -6,11 +6,36 @@ const DISCORD_MAX_UPLOAD_BYTES = 24 * 1024 * 1024; // 24 MB safe margin under Di
 export default {
   // Cron Trigger - runs automatically every 1 minute
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(syncAllChannels(env));
+    ctx.waitUntil((async () => {
+      const result = await syncAllChannels(env);
+      if (env.STATE_KV) {
+        await env.STATE_KV.put('CRON_LAST_RUN', JSON.stringify({
+          time: new Date().toISOString(),
+          result
+        }));
+      }
+    })());
   },
 
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    if (url.pathname === '/status') {
+      let lastRun = null;
+      if (env.STATE_KV) {
+        const raw = await env.STATE_KV.get('CRON_LAST_RUN');
+        if (raw) try { lastRun = JSON.parse(raw); } catch (_) {}
+      }
+      return new Response(JSON.stringify({
+        status: 'ok',
+        worker: 'warroom',
+        cronSchedule: '* * * * *',
+        hasWebhookSecret: Boolean(env.DISCORD_WEBHOOK_URL),
+        lastScheduledRun: lastRun
+      }, null, 2), {
+        headers: { 'content-type': 'application/json; charset=utf-8' }
+      });
+    }
 
     // Manual sync trigger (testing or forcing an immediate pull)
     if (url.pathname === '/test') {
