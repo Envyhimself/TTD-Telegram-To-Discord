@@ -37,14 +37,22 @@ Download the standalone installer from the release tab
 
 ## Running Multiple Instances
 
+> [!WARNING]
+> **Using the same Telegram channels and the same Discord webhook in more than one Worker sends every message multiple times.** KV deduplication works inside one Worker only; separate Workers have separate KV state and cannot deduplicate each other.
+>
+> Before creating another Worker, decide whether you want an additional destination:
+> - **Different Discord webhook:** create another Worker with a unique name.
+> - **Same Discord webhook:** reuse/update the existing Worker, or delete the old Worker first. Do not run both.
+
 To run multiple relays on one Cloudflare account:
 
 1. Create a separate folder for each relay (e.g. `C:\TTD\News1`, `C:\TTD\News2`).
 2. Run the wizard executable inside each folder.
 3. Choose a unique Worker name for each one (e.g. `ttd-news-one`, `ttd-news-two`).
 4. Enter the specific channels and target Discord webhook for that instance.
+5. Confirm that no other active Worker uses the same Telegram channels with the same webhook.
 
-Each instance runs independently without cursor conflicts or shared state.
+Each instance runs independently without cursor conflicts or shared state. That isolation is why two Workers targeting the same channels and webhook produce duplicate Discord messages.
 
 ---
 
