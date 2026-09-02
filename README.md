@@ -8,10 +8,10 @@ Runs 24/7 on **Cloudflare Workers** (cron `* * * * *`) with **Cloudflare KV** cu
 
 ## What TTD Does
 
-- **Multi-channel forwarding**: Mirror any public Telegram channel (`@warroom`, `@news_hut`, etc.) to Discord.
+- **Multi-channel forwarding**: Mirror any public Telegram channel (`@example`, `@example`, etc.) to Discord.
 - **Direct media uploads**: Downloads real `.mp4` videos and uploads them to Discord as multipart attachments (`files[0]`) instead of posting bare links.
 - **Clean output**: Strips `t.me` URLs and renders clean text, bold headers, paragraphs, and photos.
-- **Multiple relays per account**: Pick a unique Worker name per setup (`ttd-war`, `ttd-crypto`). Each installation gets its own isolated Worker, KV namespace, secret, cron trigger, and `workers.dev` URL.
+- **Multiple relays per account**: Pick a unique Worker name per setup (`example`, `example2`). Each installation gets its own isolated Worker, KV namespace, secret, cron trigger, and `workers.dev` URL.
 - **Zero defaults**: You choose and paste exactly which channels you want.
 - **Sanctions-proof & serverless**: Scraping and webhook delivery execute entirely at Cloudflare's edge.
 
@@ -26,8 +26,8 @@ Download the standalone installer from the release tab
 
 ### How the Wizard Works
 
-1. **Unique Worker Name**: Choose a name for this relay instance (e.g. `ttd-war-news`).
-2. **Channel Selection**: Paste your Telegram handles (comma-separated, e.g. `warroom, news_hut`).
+1. **Unique Worker Name**: Choose a name for this relay instance (e.g. `example`).
+2. **Channel Selection**: Paste your Telegram handles (comma-separated, e.g. `example, example`).
 3. **Automated Setup**: Extracts files and installs required dependencies.
 4. **Discord Webhook**: Enter your Discord webhook URL (with validation and optional skip for restricted networks).
 5. **Cloudflare Login**: Authenticates via Cloudflare browser popup (once).
@@ -46,9 +46,9 @@ Download the standalone installer from the release tab
 
 To run multiple relays on one Cloudflare account:
 
-1. Create a separate folder for each relay (e.g. `C:\TTD\News1`, `C:\TTD\News2`).
+1. Create a separate folder for each relay (e.g. `C:\TTD\example1`, `C:\TTD\example2`).
 2. Run the wizard executable inside each folder.
-3. Choose a unique Worker name for each one (e.g. `ttd-news-one`, `ttd-news-two`).
+3. Choose a unique Worker name for each one (e.g. `ttd-example-one`, `ttd-example-two`).
 4. Enter the specific channels and target Discord webhook for that instance.
 5. Confirm that no other active Worker uses the same Telegram channels with the same webhook.
 
