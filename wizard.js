@@ -99,6 +99,10 @@ export function validateWorkerName(raw) {
   return { ok: true, name };
 }
 
+export function extractWorkerUrl(output) {
+  return (String(output || '').match(/https:\/\/[a-z0-9-]+(?:\.[a-z0-9-]+)*\.workers\.dev\b/i) || [])[0] || '';
+}
+
 async function chooseWorkerName() {
   line();
   console.log(c.b('Choose a unique Cloudflare Worker name'));
@@ -157,6 +161,7 @@ if (process.argv.includes('--selftest')) {
   assert(validateWorkerName('').ok === false, 'worker name required');
   assert(validateWorkerName('has spaces').ok === false, 'worker name rejects spaces');
   assert(validateWorkerName('-bad').ok === false, 'worker name rejects edge hyphen');
+  assert(extractWorkerUrl('Deployed warroom triggers (3.40 sec)\n  https://warroom.amoaaa.workers.dev\n  schedule: * * * * *') === 'https://warroom.amoaaa.workers.dev', 'nested workers.dev url');
   console.log('wizard selftest OK');
   process.exit(0);
 }
@@ -282,8 +287,9 @@ id = "${kvId}"
 
   console.log(c.dim('Deploying to Cloudflare (this creates the Worker + cron)…'));
   const dep = run('npx', ['wrangler', 'deploy']);
-  const url = (dep.out.match(/https:\/\/[a-z0-9-]+\.workers\.dev/) || [])[0];
-  if (!dep.ok || !url) { console.log(dep.out); die('Deploy failed — see output above.'); }
+  const url = extractWorkerUrl(dep.out);
+  if (!dep.ok && !url) { console.log(dep.out); die('Deploy failed — see output above.'); }
+  if (!url) { console.log(dep.out); die('Deploy finished but could not find the workers.dev URL in the output.'); }
   console.log(c.green('✔') + ' Deployed: ' + c.b(url));
 
   // 6. secret + live test
