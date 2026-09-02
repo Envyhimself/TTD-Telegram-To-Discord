@@ -19,7 +19,7 @@ Runs 24/7 on **Cloudflare Workers** (cron `* * * * *`) with **Cloudflare KV** cu
 
 ## Quick Start (Pre-built Executable)
 
-Download the standalone installer from the [Version 1 Release](https://github.com/Envyhimself/TTD-Telegram-To-Discord/releases/tag/v1.0.0):
+Download the standalone installer from the [v1.0.0Release](https://github.com/Envyhimself/TTD-Telegram-To-Discord/releases/tag/v1.0.0):
 
 - **Windows**: `telegram-wizard-windows-x64.exe`
 - **Linux**: `telegram-wizard-linux-x64`
