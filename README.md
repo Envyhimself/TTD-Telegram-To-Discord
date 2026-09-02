@@ -1,4 +1,4 @@
-# TTD — Telegram to Discord (Version 1)
+# TTD — Telegram to Discord 
 
 Automated, serverless relay that mirrors public Telegram channels to Discord webhooks with clean text formatting, inline images, and real MP4 video attachments.
 
@@ -6,7 +6,7 @@ Runs 24/7 on **Cloudflare Workers** (cron `* * * * *`) with **Cloudflare KV** cu
 
 ---
 
-## What Version 1 Does
+## What TTD Does
 
 - **Multi-channel forwarding**: Mirror any public Telegram channel (`@warroom`, `@news_hut`, etc.) to Discord.
 - **Direct media uploads**: Downloads real `.mp4` videos and uploads them to Discord as multipart attachments (`files[0]`) instead of posting bare links.
