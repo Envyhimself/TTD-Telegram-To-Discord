@@ -295,7 +295,7 @@ id = "${kvId}"
   // 6. secret + live test
   line();
   console.log(c.dim('Storing webhook as an encrypted Worker secret…'));
-  const sec = spawnSync('npx', ['wrangler', 'secret', 'put', 'DISCORD_WEBHOOK_URL'],
+  const sec = spawnSync('npx', ['wrangler', 'secret', 'put', 'DISCORD_WEBHOOK_URL', '--name', workerName],
     { input: webhook + '\n', encoding: 'utf8', shell: true });
   if (sec.status !== 0) { console.log((sec.stdout || '') + (sec.stderr || '')); die('Could not store the secret.'); }
   console.log(c.green('✔') + ' Secret stored');
