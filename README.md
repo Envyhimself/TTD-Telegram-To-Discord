@@ -19,7 +19,7 @@ Runs 24/7 on **Cloudflare Workers** (cron `* * * * *`) with **Cloudflare KV** cu
 
 ## Quick Start (Pre-built Executable)
 
-Download the standalone installer from the release 
+Download the standalone installer from the release tab
 
 - **Windows**: `telegram-wizard-windows-x64.exe`
 - **Linux**: `telegram-wizard-linux-x64`
