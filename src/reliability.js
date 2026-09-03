@@ -39,6 +39,60 @@ export function buildFallbackContent(text, videoUrls, reason) {
   return `${head}\n\n${suffix}`;
 }
 
+export function buildEditPayload(msg) {
+  const videoUrls = (msg.videos || []).map(v => v.url || v);
+  const content = videoUrls.length
+    ? buildFallbackContent(msg.text, videoUrls, 'edited media')
+    : (msg.text || '').slice(0, 2000);
+  const embeds = (msg.images || []).slice(0, 4).map(url => ({ image: { url } }));
+  return { content, embeds, attachments: [] };
+}
+
+export function buildDiscordMessageUrl(webhookUrl, discordMessageId) {
+  const url = new URL(webhookUrl);
+  url.pathname = `${url.pathname}/messages/${discordMessageId}`;
+  return url.toString();
+}
+
+// Signed Telegram video URLs rotate on every fetch, so fingerprints normalize
+// video URLs to origin+path; image URLs and converted text are stable.
+export function normalizeVideoUrl(url) {
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return url;
+  }
+}
+
+export async function fingerprintMessage(msg) {
+  const data = [
+    msg.text || '',
+    (msg.images || []).map(normalizeVideoUrl).join('|'),
+    (msg.videos || []).map(v => normalizeVideoUrl(v.url || v)).join('|')
+  ].join('\u0000');
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Returns mapped posts whose Telegram-side content changed since last delivery.
+export async function selectEditedMessages(messages, mappings) {
+  const out = [];
+  for (const message of messages) {
+    const mapping = mappings[String(message.id)];
+    if (!mapping || !mapping.fingerprint) continue;
+    const fingerprint = await fingerprintMessage(message);
+    if (fingerprint !== mapping.fingerprint) out.push({ message, fingerprint, mapping });
+  }
+  return out;
+}
+
+export function buildWaitWebhookUrl(webhookUrl) {
+  const url = new URL(webhookUrl);
+  if (!url.searchParams.has('wait')) url.searchParams.set('wait', 'true');
+  return url.toString();
+}
+
 export function healthFromLastRun(lastRun, now = Date.now()) {
   if (!lastRun || !lastRun.time) return { healthy: false, reason: 'never-ran', ageMs: null };
   const ageMs = Math.max(0, now - Date.parse(lastRun.time));

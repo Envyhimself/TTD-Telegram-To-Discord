@@ -1,5 +1,5 @@
 import { CHANNELS, fetchChannelMessages } from './telegram.js';
-import { buildFallbackContent, classifyVideo, healthFromLastRun, nextFailureAction, selectMessageBatch } from './reliability.js';
+import { buildDiscordMessageUrl, buildEditPayload, buildFallbackContent, buildWaitWebhookUrl, classifyVideo, fingerprintMessage, healthFromLastRun, nextFailureAction, selectEditedMessages, selectMessageBatch } from './reliability.js';
 
 const DISCORD_WEBHOOK_MAX_EMBEDS = 4;
 const RUN_LOCK_TTL_SECONDS = 60;
@@ -45,7 +45,7 @@ async function readJson(kv, key) {
 async function runAndRecord(env, source) {
   if (!env.STATE_KV) return syncAllChannels(env);
   const lock = await env.STATE_KV.get('SYNC_LOCK');
-  if (lock && source !== 'manual') return { status: 'skipped', reason: 'sync-already-running' };
+  if (lock) return { status: 'skipped', reason: 'sync-already-running' };
   await env.STATE_KV.put('SYNC_LOCK', new Date().toISOString(), { expirationTtl: RUN_LOCK_TTL_SECONDS });
   try {
     const result = await syncAllChannels(env);
@@ -71,6 +71,27 @@ async function syncAllChannels(env) {
   return { status: results.every(r => r.status === 'ok') ? 'ok' : 'partial', channels: results };
 }
 
+async function loadMappings(kv, handle) {
+  if (!kv) return {};
+  const raw = await kv.get(`msgmap:${handle}`);
+  if (!raw) return {};
+  try { return JSON.parse(raw) || {}; } catch { return {}; }
+}
+
+// Keep the newest 300 mappings so KV stays small; edits older than the page
+// window are unreachable on the public preview anyway.
+async function saveMappings(kv, handle, map) {
+  const ids = Object.keys(map).map(Number).sort((a, b) => b - a).slice(0, 300);
+  const trimmed = {};
+  for (const id of ids) trimmed[id] = map[id];
+  await kv.put(`msgmap:${handle}`, JSON.stringify(trimmed));
+}
+
+async function recordMapping(kv, handle, map, msg, discordMessageId) {
+  if (!kv || !discordMessageId) return;
+  map[String(msg.id)] = { discordMessageId: String(discordMessageId), fingerprint: await fingerprintMessage(msg) };
+}
+
 async function syncChannel(channel, env, webhookUrl) {
   const messages = await fetchChannelMessages(channel.handle);
   const kvKey = `last_seen:${channel.handle}`;
@@ -81,14 +102,12 @@ async function syncChannel(channel, env, webhookUrl) {
     if (val) lastSeenId = parseInt(val, 10);
   }
 
+  const mappings = await loadMappings(env.STATE_KV, channel.handle);
   const newMessages = selectMessageBatch(messages, lastSeenId);
 
-  if (!newMessages?.length) {
-    return { channel: channel.handle, status: 'ok', postedCount: 0, lastSeenId, message: 'No new posts.' };
-  }
-
   let cursor = lastSeenId;
-  const postedIds = [], fallbackIds = [], skippedIds = [], failedIds = [];
+  const postedIds = [], fallbackIds = [], skippedIds = [], failedIds = [], editedIds = [], editFailedIds = [];
+
   for (const msg of newMessages) {
     if (!msg.hasContent) {
       skippedIds.push(msg.id);
@@ -96,10 +115,11 @@ async function syncChannel(channel, env, webhookUrl) {
       continue;
     }
 
-    let outcome = await postToWebhook(webhookUrl, channel.name, msg);
     const failureKey = `failure:${channel.handle}:${msg.id}`;
+    let outcome = await postToWebhook(buildWaitWebhookUrl(webhookUrl), channel.name, msg);
 
     if (outcome.status === 'posted') {
+      await recordMapping(env.STATE_KV, channel.handle, mappings, msg, outcome.discordMessageId);
       if (env.STATE_KV) await env.STATE_KV.delete(failureKey);
       cursor = Math.max(cursor, msg.id);
       postedIds.push(msg.id);
@@ -110,8 +130,9 @@ async function syncChannel(channel, env, webhookUrl) {
     if (env.STATE_KV) await env.STATE_KV.put(failureKey, String(failures), { expirationTtl: 86400 });
 
     if (outcome.status === 'fallback' || nextFailureAction(failures) === 'fallback') {
-      const fallback = await postFallback(webhookUrl, channel.name, msg, outcome.reason);
-      if (fallback) {
+      const fb = await postFallback(buildWaitWebhookUrl(webhookUrl), channel.name, msg, outcome.reason);
+      if (fb.ok) {
+        await recordMapping(env.STATE_KV, channel.handle, mappings, msg, fb.discordMessageId);
         cursor = Math.max(cursor, msg.id);
         fallbackIds.push(msg.id);
         if (env.STATE_KV) {
@@ -126,12 +147,26 @@ async function syncChannel(channel, env, webhookUrl) {
     break;
   }
 
+  // Sync edits to posts we already delivered (visible in the latest page window).
+  for (const { message, fingerprint, mapping } of await selectEditedMessages(messages, mappings)) {
+    const result = await editDiscordMessage(webhookUrl, mapping.discordMessageId, message);
+    if (result.status === 'ok') {
+      mappings[String(message.id)] = { discordMessageId: mapping.discordMessageId, fingerprint };
+      editedIds.push(message.id);
+    } else if (result.status === 'gone') {
+      delete mappings[String(message.id)]; // Discord message deleted or expired — stop retrying
+    } else {
+      editFailedIds.push(message.id);
+    }
+  }
+
   if (env.STATE_KV && cursor > lastSeenId) await env.STATE_KV.put(kvKey, String(cursor));
+  if (env.STATE_KV) await saveMappings(env.STATE_KV, channel.handle, mappings);
   return {
     channel: channel.handle,
-    status: failedIds.length ? 'partial' : 'ok',
+    status: failedIds.length || editFailedIds.length ? 'partial' : 'ok',
     postedCount: postedIds.length,
-    postedIds, fallbackIds, skippedIds, failedIds, cursor
+    postedIds, fallbackIds, skippedIds, failedIds, editedIds, editFailedIds, cursor
   };
 }
 
@@ -145,6 +180,15 @@ function basePayload(channelName, content) {
   return { username: channelName, avatar_url: 'https://telegram.org/img/t_logo.png', content: content || undefined };
 }
 
+async function discordPostResult(res) {
+  if (!res.ok && res.status !== 204) return { status: 'failed', reason: `discord-http-${res.status}` };
+  let discordMessageId = null;
+  if (res.status === 200) {
+    try { discordMessageId = (await res.json())?.id || null; } catch { /* empty body */ }
+  }
+  return { status: 'posted', discordMessageId };
+}
+
 async function postFallback(webhookUrl, channelName, msg, reason) {
   const videoUrls = (msg.videos || []).map(v => v.url || v);
   const content = buildFallbackContent(msg.text, videoUrls, reason);
@@ -152,7 +196,30 @@ async function postFallback(webhookUrl, channelName, msg, reason) {
   const posters = (msg.videos || []).map(v => v.poster).filter(Boolean).slice(0, DISCORD_WEBHOOK_MAX_EMBEDS);
   if (posters.length) payload.embeds = posters.map(url => ({ image: { url } }));
   const res = await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-  return res.ok || res.status === 204;
+  if (!res.ok && res.status !== 204) return { ok: false, status: res.status };
+  let discordMessageId = null;
+  if (res.status === 200) {
+    try { discordMessageId = (await res.json())?.id || null; } catch { /* empty body */ }
+  }
+  return { ok: true, discordMessageId };
+}
+
+// Re-send updated content to an existing Discord message via the webhook's
+// message-edit endpoint. Images are refreshed as embeds; videos are sent as
+// links (Discord does not allow attachment replacement on edits).
+async function editDiscordMessage(webhookUrl, discordMessageId, msg) {
+  const url = buildDiscordMessageUrl(webhookUrl, discordMessageId);
+  const payload = buildEditPayload(msg);
+  try {
+    const res = await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (res.ok) return { status: 'ok' };
+    if (res.status === 404) return { status: 'gone' };
+    const body = await res.text().catch(() => '');
+    console.error(`Discord edit failed for ${discordMessageId}: HTTP ${res.status} ${body.slice(0, 200)}`);
+    return { status: 'failed', reason: `discord-http-${res.status}` };
+  } catch (err) {
+    return { status: 'failed', reason: 'edit-network-error' };
+  }
 }
 
 async function postToWebhook(webhookUrl, channelName, msg) {
@@ -187,7 +254,7 @@ async function postToWebhook(webhookUrl, channelName, msg) {
     files.forEach((blob, i) => form.append(`files[${i}]`, blob, `video_${msg.id}_${i + 1}.mp4`));
     try {
       const res = await fetch(webhookUrl, { method: 'POST', body: form });
-      if (res.ok || res.status === 204) return { status: 'posted' };
+      if (res.ok || res.status === 204) return discordPostResult(res);
       const body = await res.text();
       console.error(`Discord rejected video ${msg.id}: HTTP ${res.status} ${body}`);
       return { status: res.status === 413 ? 'fallback' : 'failed', reason: `discord-http-${res.status}` };
@@ -202,7 +269,7 @@ async function postToWebhook(webhookUrl, channelName, msg) {
   if (embeds.length) payload.embeds = embeds;
   try {
     const res = await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    return res.ok || res.status === 204 ? { status: 'posted' } : { status: 'failed', reason: `discord-http-${res.status}` };
+    return res.ok || res.status === 204 ? await discordPostResult(res) : { status: 'failed', reason: `discord-http-${res.status}` };
   } catch {
     return { status: 'failed', reason: 'discord-network-error' };
   }
