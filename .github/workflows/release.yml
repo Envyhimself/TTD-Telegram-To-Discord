@@ -26,7 +26,10 @@ jobs:
       - name: Install deps
         run: npm install
       - name: Self-test
-        run: node wizard.js --selftest
+        shell: bash
+        run: |
+          node wizard.js --selftest
+          node test-reliability.mjs
       - name: Build standalone ${{ matrix.asset }}
         shell: bash
         run: |

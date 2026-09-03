@@ -1,193 +1,209 @@
 import { CHANNELS, fetchChannelMessages } from './telegram.js';
+import { buildFallbackContent, classifyVideo, healthFromLastRun, nextFailureAction, selectMessageBatch } from './reliability.js';
 
 const DISCORD_WEBHOOK_MAX_EMBEDS = 4;
-const DISCORD_MAX_UPLOAD_BYTES = 24 * 1024 * 1024; // 24 MB safe margin under Discord's 25 MB limit
+const RUN_LOCK_TTL_SECONDS = 60;
 
 export default {
-  // Cron Trigger - runs automatically every 1 minute
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil((async () => {
-      const result = await syncAllChannels(env);
-      if (env.STATE_KV) {
-        await env.STATE_KV.put('CRON_LAST_RUN', JSON.stringify({
-          time: new Date().toISOString(),
-          result
-        }));
-      }
-    })());
+  async scheduled(_event, env, ctx) {
+    ctx.waitUntil(runAndRecord(env, 'cron'));
   },
 
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (url.pathname === '/status') {
-      let lastRun = null;
-      if (env.STATE_KV) {
-        const raw = await env.STATE_KV.get('CRON_LAST_RUN');
-        if (raw) try { lastRun = JSON.parse(raw); } catch (_) {}
-      }
-      return new Response(JSON.stringify({
-        status: 'ok',
-        worker: 'warroom',
+    if (url.pathname === '/health' || url.pathname === '/status') {
+      const lastRun = await readJson(env.STATE_KV, 'CRON_LAST_RUN');
+      const health = healthFromLastRun(lastRun);
+      const deadLetters = await readJson(env.STATE_KV, 'DEAD_LETTERS') || [];
+      return Response.json({
+        status: health.healthy ? 'healthy' : 'unhealthy',
+        healthy: health.healthy,
+        reason: health.reason,
         cronSchedule: '* * * * *',
         hasWebhookSecret: Boolean(env.DISCORD_WEBHOOK_URL),
-        lastScheduledRun: lastRun
-      }, null, 2), {
-        headers: { 'content-type': 'application/json; charset=utf-8' }
-      });
+        lastScheduledRun: lastRun,
+        recentDeadLetters: deadLetters.slice(-10)
+      }, { status: health.healthy ? 200 : 503 });
     }
 
-    // Manual sync trigger (testing or forcing an immediate pull)
     if (url.pathname === '/test') {
-      const result = await syncAllChannels(env);
-      return new Response(JSON.stringify(result, null, 2), {
-        headers: { 'content-type': 'application/json; charset=utf-8' }
-      });
+      return Response.json(await runAndRecord(env, 'manual'));
     }
 
     return new Response('Telegram to Discord Sync Worker is running.', { status: 200 });
   }
 };
 
+async function readJson(kv, key) {
+  if (!kv) return null;
+  const raw = await kv.get(key);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+async function runAndRecord(env, source) {
+  if (!env.STATE_KV) return syncAllChannels(env);
+  const lock = await env.STATE_KV.get('SYNC_LOCK');
+  if (lock && source !== 'manual') return { status: 'skipped', reason: 'sync-already-running' };
+  await env.STATE_KV.put('SYNC_LOCK', new Date().toISOString(), { expirationTtl: RUN_LOCK_TTL_SECONDS });
+  try {
+    const result = await syncAllChannels(env);
+    await env.STATE_KV.put('CRON_LAST_RUN', JSON.stringify({ time: new Date().toISOString(), source, result }));
+    return result;
+  } finally {
+    await env.STATE_KV.delete('SYNC_LOCK');
+  }
+}
+
 async function syncAllChannels(env) {
   const webhookUrl = env.DISCORD_WEBHOOK_URL;
-  if (!webhookUrl) {
-    return { error: 'DISCORD_WEBHOOK_URL environment variable is not configured.' };
-  }
+  if (!webhookUrl) return { status: 'error', error: 'DISCORD_WEBHOOK_URL is not configured.' };
 
   const results = [];
   for (const channel of CHANNELS) {
     try {
       results.push(await syncChannel(channel, env, webhookUrl));
     } catch (err) {
-      results.push({ channel: channel.handle, status: 'error', error: String(err && err.message || err) });
+      results.push({ channel: channel.handle, status: 'error', error: String(err?.message || err) });
     }
   }
-  return { status: 'ok', channels: results };
+  return { status: results.every(r => r.status === 'ok') ? 'ok' : 'partial', channels: results };
 }
 
 async function syncChannel(channel, env, webhookUrl) {
   const messages = await fetchChannelMessages(channel.handle);
-
   const kvKey = `last_seen:${channel.handle}`;
   let lastSeenId = 0;
   if (env.STATE_KV) {
     let val = await env.STATE_KV.get(kvKey);
-    if (!val && channel.handle === 'warroom') {
-      val = await env.STATE_KV.get('LAST_SEEN_ID');
-    }
+    if (!val && channel.handle === 'warroom') val = await env.STATE_KV.get('LAST_SEEN_ID');
     if (val) lastSeenId = parseInt(val, 10);
   }
 
-  let newMessages;
-  if (lastSeenId === 0) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].hasContent) { newMessages = [messages[i]]; break; }
-    }
-  } else {
-    newMessages = messages.filter(m => m.id > lastSeenId);
-  }
+  const newMessages = selectMessageBatch(messages, lastSeenId);
 
-  if (!newMessages || newMessages.length === 0) {
+  if (!newMessages?.length) {
     return { channel: channel.handle, status: 'ok', postedCount: 0, lastSeenId, message: 'No new posts.' };
   }
 
   let cursor = lastSeenId;
-  const postedIds = [];
-  const skippedIds = [];
-  const failedIds = [];
-
+  const postedIds = [], fallbackIds = [], skippedIds = [], failedIds = [];
   for (const msg of newMessages) {
     if (!msg.hasContent) {
       skippedIds.push(msg.id);
       cursor = Math.max(cursor, msg.id);
       continue;
     }
-    const outcome = await postToWebhook(webhookUrl, channel.name, msg);
-    if (outcome === 'posted') {
+
+    let outcome = await postToWebhook(webhookUrl, channel.name, msg);
+    const failureKey = `failure:${channel.handle}:${msg.id}`;
+
+    if (outcome.status === 'posted') {
+      if (env.STATE_KV) await env.STATE_KV.delete(failureKey);
       cursor = Math.max(cursor, msg.id);
       postedIds.push(msg.id);
       continue;
     }
-    // Preserve ordering: never advance past a failed video/message.
+
+    const failures = env.STATE_KV ? Number(await env.STATE_KV.get(failureKey) || 0) + 1 : 1;
+    if (env.STATE_KV) await env.STATE_KV.put(failureKey, String(failures), { expirationTtl: 86400 });
+
+    if (outcome.status === 'fallback' || nextFailureAction(failures) === 'fallback') {
+      const fallback = await postFallback(webhookUrl, channel.name, msg, outcome.reason);
+      if (fallback) {
+        cursor = Math.max(cursor, msg.id);
+        fallbackIds.push(msg.id);
+        if (env.STATE_KV) {
+          await env.STATE_KV.delete(failureKey);
+          await recordDeadLetter(env.STATE_KV, channel.handle, msg.id, outcome.reason, failures);
+        }
+        continue;
+      }
+    }
+
     failedIds.push(msg.id);
     break;
   }
 
-  if (env.STATE_KV && cursor > lastSeenId) {
-    await env.STATE_KV.put(kvKey, cursor.toString());
-  }
+  if (env.STATE_KV && cursor > lastSeenId) await env.STATE_KV.put(kvKey, String(cursor));
+  return {
+    channel: channel.handle,
+    status: failedIds.length ? 'partial' : 'ok',
+    postedCount: postedIds.length,
+    postedIds, fallbackIds, skippedIds, failedIds, cursor
+  };
+}
 
-  return { channel: channel.handle, status: failedIds.length ? 'partial' : 'ok', postedCount: postedIds.length, postedIds, skippedIds, failedIds, cursor };
+async function recordDeadLetter(kv, channel, id, reason, attempts) {
+  const items = await readJson(kv, 'DEAD_LETTERS') || [];
+  items.push({ time: new Date().toISOString(), channel, id, reason, attempts });
+  await kv.put('DEAD_LETTERS', JSON.stringify(items.slice(-25)));
+}
+
+function basePayload(channelName, content) {
+  return { username: channelName, avatar_url: 'https://telegram.org/img/t_logo.png', content: content || undefined };
+}
+
+async function postFallback(webhookUrl, channelName, msg, reason) {
+  const videoUrls = (msg.videos || []).map(v => v.url || v);
+  const content = buildFallbackContent(msg.text, videoUrls, reason);
+  const payload = basePayload(channelName, content);
+  const posters = (msg.videos || []).map(v => v.poster).filter(Boolean).slice(0, DISCORD_WEBHOOK_MAX_EMBEDS);
+  if (posters.length) payload.embeds = posters.map(url => ({ image: { url } }));
+  const res = await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  return res.ok || res.status === 204;
 }
 
 async function postToWebhook(webhookUrl, channelName, msg) {
   let content = msg.text || '';
-  if (content.length > 2000) content = content.substring(0, 1995) + '...';
-
+  if (content.length > 2000) content = content.slice(0, 1995) + '...';
   const videos = (msg.videos || []).slice(0, 4);
 
-  // Video posts must deliver the actual MP4. Never silently replace them with thumbnails.
-  if (videos.length > 0) {
+  if (videos.length) {
     const files = [];
-    let totalBytes = 0;
+    for (let i = 0; i < videos.length; i++) {
+      try {
+        const head = await fetch(videos[i].url, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0' } });
+        const length = Number(head.headers.get('content-length'));
+        const decision = classifyVideo({ ok: head.ok, status: head.status, length });
+        if (decision.action !== 'upload') return { status: decision.action === 'fallback' ? 'fallback' : 'failed', reason: decision.reason };
 
-    try {
-      for (let i = 0; i < videos.length; i++) {
         const vidRes = await fetch(videos[i].url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        if (!vidRes.ok) {
-          console.error(`Telegram video fetch failed: HTTP ${vidRes.status} (post ${msg.id})`);
-          return 'failed';
-        }
+        if (!vidRes.ok) return { status: 'failed', reason: `telegram-http-${vidRes.status}` };
         const buf = await vidRes.arrayBuffer();
-        totalBytes += buf.byteLength;
-        if (buf.byteLength === 0 || totalBytes > DISCORD_MAX_UPLOAD_BYTES) {
-          console.error(`Video post ${msg.id} is empty or exceeds Discord's upload limit (${totalBytes} bytes)`);
-          return 'failed';
-        }
         files.push(new Blob([buf], { type: 'video/mp4' }));
+      } catch (err) {
+        console.error(`Video fetch failed for post ${msg.id}:`, err);
+        return { status: 'failed', reason: 'video-network-error' };
       }
+    }
 
-      const form = new FormData();
-      form.append('payload_json', JSON.stringify({
-        username: channelName,
-        avatar_url: 'https://telegram.org/img/t_logo.png',
-        content: content || undefined,
-        attachments: files.map((_, i) => ({ id: i, filename: `video_${msg.id}_${i + 1}.mp4` }))
-      }));
-      files.forEach((blob, i) => form.append(`files[${i}]`, blob, `video_${msg.id}_${i + 1}.mp4`));
-
+    const form = new FormData();
+    form.append('payload_json', JSON.stringify({
+      ...basePayload(channelName, content),
+      attachments: files.map((_, i) => ({ id: i, filename: `video_${msg.id}_${i + 1}.mp4` }))
+    }));
+    files.forEach((blob, i) => form.append(`files[${i}]`, blob, `video_${msg.id}_${i + 1}.mp4`));
+    try {
       const res = await fetch(webhookUrl, { method: 'POST', body: form });
-      if (res.ok || res.status === 204) return 'posted';
-      console.error(`Discord rejected video upload (HTTP ${res.status}):`, await res.text());
-      return 'failed';
+      if (res.ok || res.status === 204) return { status: 'posted' };
+      const body = await res.text();
+      console.error(`Discord rejected video ${msg.id}: HTTP ${res.status} ${body}`);
+      return { status: res.status === 413 ? 'fallback' : 'failed', reason: `discord-http-${res.status}` };
     } catch (err) {
-      console.error(`Real video delivery failed for post ${msg.id}:`, err);
-      return 'failed';
+      return { status: 'failed', reason: 'discord-network-error' };
     }
   }
 
-  // Non-video posts: normal text + image embeds.
-  const embeds = (msg.images || []).slice(0, DISCORD_WEBHOOK_MAX_EMBEDS)
-    .map(imgUrl => ({ image: { url: imgUrl } }));
-  if (!content && embeds.length === 0) return 'empty';
-
-  const payload = {
-    username: channelName,
-    avatar_url: 'https://telegram.org/img/t_logo.png',
-    content: content || undefined
-  };
-  if (embeds.length > 0) payload.embeds = embeds;
-
+  const embeds = (msg.images || []).slice(0, DISCORD_WEBHOOK_MAX_EMBEDS).map(url => ({ image: { url } }));
+  if (!content && !embeds.length) return { status: 'posted' };
+  const payload = basePayload(channelName, content);
+  if (embeds.length) payload.embeds = embeds;
   try {
-    const res = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    return (res.ok || res.status === 204) ? 'posted' : 'failed';
-  } catch (err) {
-    console.error('Failed to post to Discord webhook:', err);
-    return 'failed';
+    const res = await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    return res.ok || res.status === 204 ? { status: 'posted' } : { status: 'failed', reason: `discord-http-${res.status}` };
+  } catch {
+    return { status: 'failed', reason: 'discord-network-error' };
   }
 }

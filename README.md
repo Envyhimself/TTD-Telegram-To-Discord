@@ -11,7 +11,11 @@ Runs 24/7 on **Cloudflare Workers** (cron `* * * * *`) with **Cloudflare KV** cu
 ## What TTD Does
 
 - **Multi-channel forwarding**: Mirror any public Telegram channel (`@warroom`, `@news_hut`, etc.) to Discord.
-- **Direct media uploads**: Downloads real `.mp4` videos and uploads them to Discord as multipart attachments (`files[0]`) instead of posting bare links.
+- **Direct media uploads**: Downloads real `.mp4` videos (<= 8 MB) and uploads them to Discord as multipart attachments (`files[0]`) instead of posting bare links.
+- **Anti-freeze video fallback**: If a video is too large (> 8 MB) or Discord/network rejects the file upload, TTD posts the post text + a direct video download link so newer channel posts never get blocked overnight.
+- **Backlog catch-up protection**: Bounds catch-up batches to 5 messages per run per channel, preventing Cloudflare execution timeout spikes during reconnects.
+- **Cron run-lock**: Prevents overlapping execution between cron runs and manual trigger requests.
+- **Health monitoring**: Built-in `/health` endpoint returning uptime, secret status, last run timestamps, and dead-letter logs.
 - **Clean output**: Strips `t.me` URLs and renders clean text, bold headers, paragraphs, and photos.
 - **Multiple relays per account**: Pick a unique Worker name per setup (`ttd-war`, `ttd-crypto`). Each installation gets its own isolated Worker, KV namespace, secret, cron trigger, and `workers.dev` URL.
 - **Zero defaults**: You choose and paste exactly which channels you want.
@@ -73,11 +77,11 @@ node wizard.js
 
 ---
 
-## Verification & Manual Trigger
-
-- **Automatic**: Runs every minute via Cloudflare Cron (`* * * * *`).
-- **Manual sync**: Open `https://<your-worker>.<subdomain>.workers.dev/test` in your browser or make a GET request to immediately trigger a sync of the latest messages.
-- **Diagnostics**: Open `https://<your-worker>.<subdomain>.workers.dev/diag` to inspect raw HTML parsing and current channel cursors.
+## Verification & Monitoring Endpoints
+ 
+- **Automatic Sync**: Runs every minute via Cloudflare Cron (`* * * * *`).
+- **Health Check**: Open `https://<your-worker>.<subdomain>.workers.dev/health` to view operational status, last run timestamps, and recent dead-letter fallback logs.
+- **Manual Sync**: Open `https://<your-worker>.<subdomain>.workers.dev/test` in your browser or make a GET request to immediately trigger a sync of the latest messages.
 
 ---
 

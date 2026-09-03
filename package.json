@@ -1,11 +1,12 @@
 {
   "name": "telegram-to-discord-worker",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "test": "node wizard.js --selftest && node test-reliability.mjs",
     "wizard": "node wizard.js"
   },
   "dependencies": {

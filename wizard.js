@@ -68,7 +68,8 @@ function materializeProject() {
     'package-lock.json',
     'src/index.js',
     'src/telegram.js',
-    'src/discord.js'
+    'src/discord.js',
+    'src/reliability.js'
   ];
   let copied = 0;
   for (const rel of files) {

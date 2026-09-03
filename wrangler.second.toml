@@ -1,4 +1,4 @@
-name = "warroom"
+name = "warroom-second"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
@@ -7,4 +7,4 @@ crons = ["* * * * *"]
 
 [[kv_namespaces]]
 binding = "STATE_KV"
-id = "de913741d98146a4ae809bff44ef9171"
+id = "eb7f95b1e639400385dc7e9888094a08"
