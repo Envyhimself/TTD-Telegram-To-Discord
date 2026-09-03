@@ -42,20 +42,28 @@ export function extractVideos(node) {
   return videos.filter((v, i, all) => all.findIndex(x => x.url === v.url) === i);
 }
 
-// Convert Telegram preview HTML into Discord markdown
-export function htmlToDiscord(html) {
+// Convert Telegram preview HTML into clean Discord markdown.
+// selfHandle: the channel's own handle — self-signature links are dropped.
+export function htmlToDiscord(html, selfHandle = '') {
   if (!html) return '';
   let s = html;
   s = s.replace(/<br\s*\/?>/gi, '\n');
   s = s.replace(/<(b|strong)>([\s\S]*?)<\/\1>/gi, '**$2**');
   s = s.replace(/<(i|em)>([\s\S]*?)<\/\1>/gi, '*$2*');
   s = s.replace(/<(s|del|strike)>([\s\S]*?)<\/\1>/gi, '~~$2~~');
-  s = s.replace(/<u>([\s\S]*?)<\/u>/gi, '__$1__');
+  // Discord has no underline markdown; '__' would render as strikethrough. Drop it.
+  s = s.replace(/<u>([\s\S]*?)<\/u>/gi, '$1');
   s = s.replace(/<blockquote[^>]*>/gi, '\n> ');
   s = s.replace(/<\/blockquote>/gi, '\n');
   s = s.replace(/<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (_, href, txt) => {
-    const t = txt.replace(/<[^>]*>/g, '').trim();
-    if (!t || t === href) return href;
+    const t = txt.replace(/<[^>]*>/g, '').replace(/\*/g, '').trim();
+    if (!t) return '';
+    // Self-signature link (e.g. "@WarRoom" at end of its own posts) — drop it.
+    // Telegram link text may carry nbsp/extra spaces, so compare whitespace-stripped.
+    if (selfHandle && t.replace(/\s+/g, '').toLowerCase() === ('@' + selfHandle).toLowerCase()) return '';
+    // Relative/search hrefs (Telegram hashtags like "?q=%23fari") are dead in Discord — keep the text.
+    if (!/^https?:\/\//i.test(href)) return t;
+    if (t === href) return href;
     return `[${t}](${href})`;
   });
   s = s.replace(/<tg-emoji[^>]*>([\s\S]*?)<\/tg-emoji>/gi, '$1');
@@ -64,7 +72,19 @@ export function htmlToDiscord(html) {
        .replace(/&#0?39;/g, "'").replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
   s = s.replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)));
   s = s.replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)));
+  s = s.replace(/[\u00a0\u2000-\u200b]/g, ' '); // nbsp & other unicode spaces (incl. from &#160;)
   s = s.replace(/\*\*\*\*/g, '');
+  // Un-bold emoji-only segments: Discord renders **😍** as literal asterisks.
+  s = s.replace(/\*\*((?:[\p{Extended_Pictographic}\uFE0F\u200D\u2600-\u27BF\u2B00-\u2BFF\u2190-\u21FF\u2300-\u23FF\s])+)\*\*/gu, '$1');
+  s = s.replace(/\*\*\s*\*\*/g, '');
+  s = s.replace(/[ \t]+\n/g, '\n');
+  s = s.replace(/[ \t]{2,}/g, ' ');
+  // Drop consecutive duplicate lines (channels often paste the same link twice).
+  s = s.split('\n').reduce((acc, line) => {
+    if (line.trim() && acc.length && acc[acc.length - 1] === line) return acc;
+    acc.push(line);
+    return acc;
+  }, []).join('\n');
   s = s.replace(/\n{3,}/g, '\n\n');
   return s.trim();
 }
@@ -86,7 +106,7 @@ export async function fetchChannelMessages(handle) {
     const id = parseInt(postAttr.split('/')[1], 10);
     if (isNaN(id)) continue;
     const textNode = node.querySelector('.tgme_widget_message_text') || node.querySelector('.js-message_text');
-    const text = textNode ? htmlToDiscord(textNode.innerHTML || '') : '';
+    const text = textNode ? htmlToDiscord(textNode.innerHTML || '', handle) : '';
     const images = extractImages(node);
     const videos = extractVideos(node);
     messages.push({ id, text, images, videos, hasContent: !!(text || images.length || videos.length) });
