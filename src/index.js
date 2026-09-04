@@ -8,6 +8,7 @@ import {
   fingerprintMessage,
   healthFromLastRun,
   lockShouldSkip,
+  MAX_PERMANENT_FAILURES,
   MAX_VIDEO_UPLOADS_PER_RUN,
   nextFailureAction,
   RUN_LOCK_STALE_MS,
@@ -49,6 +50,12 @@ export default {
 
     if (url.pathname === '/test') {
       return Response.json(await runAndRecord(env, 'manual'));
+    }
+
+    if (url.pathname === '/wd-kick') {
+      // Watchdog recovery endpoint: force a fresh sync (same as /test,
+      // labeled 'watchdog' so the run is distinguishable in CRON_LAST_RUN).
+      return Response.json(await runAndRecord(env, 'watchdog'));
     }
 
     return new Response('Telegram to Discord Sync Worker is running.', { status: 200 });
@@ -167,6 +174,22 @@ async function syncChannel(channel, env, webhookUrl, videoBudget) {
         }
         continue;
       }
+    }
+
+    if (failures >= MAX_PERMANENT_FAILURES) {
+      // Permanently undeliverable (e.g. a video whose signed URL keeps
+      // expiring, or a Discord rejection). Emitting it again just fails again
+      // and wedges the cursor — which would block EVERY later post in this
+      // channel forever. Record a dead letter, advance past it, and keep the
+      // channel flowing. The next post will reach Discord again.
+      if (env.STATE_KV) {
+        await recordDeadLetter(env.STATE_KV, channel.handle, msg.id,
+          'permanent-giveup:' + (outcome.reason || 'unknown'), failures);
+        await env.STATE_KV.delete(failureKey);
+      }
+      cursor = Math.max(cursor, msg.id);
+      skippedIds.push(msg.id);
+      continue;
     }
 
     failedIds.push(msg.id);

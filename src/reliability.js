@@ -6,6 +6,12 @@ export const MAX_VIDEO_UPLOADS_PER_RUN = 2;
 
 export const RUN_LOCK_TTL_SECONDS = 900;
 export const RUN_LOCK_STALE_MS = 600_000;
+// A post that fails this many times in a row is treated as permanently
+// undeliverable (e.g. a video whose signed URL keeps expiring). Rather than
+// wedge the channel cursor on it forever (which would block every later post
+// and keep reporting 'partial'), the relay emits it as a dead-letter link and
+// advances past it so the rest of the channel keeps flowing.
+export const MAX_PERMANENT_FAILURES = 10;
 
 export function lockShouldSkip(lockValue, now = Date.now()) {
   if (!lockValue) return false;

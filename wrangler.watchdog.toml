@@ -1,0 +1,22 @@
+name = "ttd-watchdog"
+main = "src/watchdog.js"
+compatibility_date = "2024-01-01"
+
+[[kv_namespaces]]
+binding = "WATCHDOG_LOG"
+id = "e9cd428e1d914fd49718a5b55e791745"
+
+[[services]]
+binding = "WARROOM"
+service = "warroom"
+
+[[services]]
+binding = "WARROOM_SECOND"
+service = "warroom-second"
+
+[[services]]
+binding = "HAMBURGER"
+service = "hamburger"
+
+[triggers]
+crons = ["*/5 * * * *"]
