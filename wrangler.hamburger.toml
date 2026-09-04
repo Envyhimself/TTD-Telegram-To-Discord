@@ -1,0 +1,10 @@
+name = "hamburger"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[kv_namespaces]]
+binding = "STATE_KV"
+id = "3239757bf4424588afb39052dad51c86"

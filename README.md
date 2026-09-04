@@ -12,6 +12,7 @@ Runs 24/7 on **Cloudflare Workers** (cron `* * * * *`) with **Cloudflare KV** cu
 
 - **Multi-channel forwarding**: Mirror any public Telegram channel (`@warroom`, `@news_hut`, etc.) to Discord.
 - **Direct media uploads**: Downloads real `.mp4` videos (<= 8 MB) and uploads them to Discord as multipart attachments (`files[0]`) instead of posting bare links.
+- **24/7 uptime (v1.1.2)**: A self-healing run lock (15-minute TTL, 10-minute stale break) plus a per-run CPU budget (≤2 video uploads, extras fall back to instant links) guarantee the relay can never wedge on `cron-stale`, even when heavy video batches pile up overnight.
 - **Telegram edit synchronization**: When a recently mirrored Telegram post is edited, its mapped Discord message is updated in place on the next one-minute sync. Available for posts first delivered by v1.1.1 or later while they remain visible in Telegram's public preview.
 - **Anti-freeze video fallback**: If a video is too large (> 8 MB) or Discord/network rejects the file upload, TTD posts the post text + a direct video download link so newer channel posts never get blocked overnight.
 - **Backlog catch-up protection**: Bounds catch-up batches to 5 messages per run per channel, preventing Cloudflare execution timeout spikes during reconnects.

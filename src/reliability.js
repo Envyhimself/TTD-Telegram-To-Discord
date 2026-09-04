@@ -1,104 +1,120 @@
-export const SAFE_DISCORD_UPLOAD_BYTES = 8 * 1024 * 1024;
-export const MAX_FAILURES_BEFORE_FALLBACK = 3;
-export const HEALTH_STALE_MS = 150_000;
+export const DISCORD_UPLOAD_SAFE_LIMIT = 8 * 1024 * 1024;
+export const MAX_RETRY_ATTEMPTS = 2;
+export const HEALTH_STALE_MS = 180_000;
 export const MAX_MESSAGES_PER_RUN = 5;
+export const MAX_VIDEO_UPLOADS_PER_RUN = 2;
 
-export function selectMessageBatch(messages, lastSeenId, limit = MAX_MESSAGES_PER_RUN) {
-  if (!lastSeenId) {
-    const newest = [...messages].reverse().find(m => m.hasContent);
-    return newest ? [newest] : [];
-  }
-  return messages.filter(m => m.id > lastSeenId).slice(0, limit);
+export const RUN_LOCK_TTL_SECONDS = 900;
+export const RUN_LOCK_STALE_MS = 600_000;
+
+export function lockShouldSkip(lockValue, now = Date.now()) {
+  if (!lockValue) return false;
+  const lockTime = new Date(lockValue).getTime();
+  if (Number.isNaN(lockTime)) return false;
+  return (now - lockTime) < RUN_LOCK_STALE_MS;
 }
 
-export function classifyVideo({ ok, status = 0, length }) {
-  if (!ok) return { action: 'retry', reason: `telegram-http-${status || 'error'}` };
-  if (!Number.isFinite(length) || length <= 0) return { action: 'retry', reason: 'unknown-size' };
-  if (length > SAFE_DISCORD_UPLOAD_BYTES) return { action: 'fallback', reason: 'discord-upload-limit', length };
+export function classifyVideoBatch(uploadedCount) {
+  return uploadedCount < MAX_VIDEO_UPLOADS_PER_RUN ? 'upload' : 'fallback';
+}
+
+export function classifyVideo(headResponse) {
+  if (!headResponse || !headResponse.ok) {
+    return { action: 'retry', reason: 'telegram-head-failed' };
+  }
+  const length = Number(headResponse.length);
+  if (!Number.isFinite(length) || length <= 0) {
+    return { action: 'retry', reason: 'telegram-unknown-length' };
+  }
+  if (length > DISCORD_UPLOAD_SAFE_LIMIT) {
+    return { action: 'fallback', reason: 'discord-upload-limit' };
+  }
   return { action: 'upload', length };
 }
 
-export function nextFailureAction(count) {
-  return count >= MAX_FAILURES_BEFORE_FALLBACK ? 'fallback' : 'retry';
+export function nextFailureAction(attempts) {
+  return attempts >= MAX_RETRY_ATTEMPTS ? 'fallback' : 'retry';
 }
 
-// Builds a <=2000-char Discord body for a message whose video could not be
-// uploaded. The download link is guaranteed to survive truncation.
-export function buildFallbackContent(text, videoUrls, reason) {
-  const links = videoUrls.map((u, i) => `[Download video ${i + 1}](${u})`).join('\n');
-  const note = `⚠️ Video sent as a link${reason ? ` (${reason})` : ''}.`;
-  const suffix = [links, note].filter(Boolean).join('\n\n');
-  if (!text) return suffix.slice(0, 2000);
-  if (!suffix) return text.slice(0, 2000);
+export function buildFallbackContent(text, videoUrls = [], reason = 'file size / network') {
+  const links = videoUrls.map((url, i) => `[Video ${i + 1}](${url})`).join('\n');
+  const note = `*(Video delivered via direct link due to ${reason})*`;
+  return [text, links, note].filter(Boolean).join('\n\n');
+}
 
-  const overhead = 2; // '\n\n' separator length
-  const maxHeadLen = Math.max(0, 2000 - suffix.length - overhead);
-  if (text.length <= maxHeadLen) return `${text}\n\n${suffix}`;
-  if (maxHeadLen <= 1) return suffix.slice(0, 2000);
-  const head = text.slice(0, maxHeadLen - 1) + '…';
-  return `${head}\n\n${suffix}`;
+export function selectMessageBatch(messages, lastSeenId, maxMessages = MAX_MESSAGES_PER_RUN) {
+  return (messages || [])
+    .filter(m => m.id > lastSeenId)
+    .sort((a, b) => a.id - b.id)
+    .slice(0, maxMessages);
+}
+
+export function healthFromLastRun(lastRun, now = Date.now()) {
+  if (!lastRun || !lastRun.time) return { healthy: false, reason: 'never-run' };
+  const lastTime = new Date(lastRun.time).getTime();
+  if (Number.isNaN(lastTime) || (now - lastTime) > HEALTH_STALE_MS) {
+    return { healthy: false, reason: 'cron-stale' };
+  }
+  const status = lastRun.result?.status;
+  if (status !== 'ok') {
+    return { healthy: false, reason: `last-run-${status || 'failed'}` };
+  }
+  return { healthy: true, reason: 'ok' };
+}
+
+export function buildWaitWebhookUrl(url) {
+  if (!url) return url;
+  const parsed = new URL(url);
+  parsed.searchParams.set('wait', 'true');
+  return parsed.toString();
+}
+
+export function buildDiscordMessageUrl(webhookUrl, messageId) {
+  const parsed = new URL(webhookUrl);
+  parsed.search = '';
+  const base = parsed.toString().replace(/\/+$/, '');
+  return `${base}/messages/${messageId}`;
+}
+
+export async function fingerprintMessage(msg) {
+  const text = (msg.text || '').trim();
+  const rawImages = (msg.images || []).map(u => {
+    try { const parsed = new URL(u); parsed.search = ''; return parsed.toString(); } catch { return u; }
+  }).sort().join('|');
+  const rawVideos = (msg.videos || []).map(v => {
+    const raw = typeof v === 'string' ? v : (v.url || '');
+    try { const parsed = new URL(raw); parsed.search = ''; return parsed.toString(); } catch { return raw; }
+  }).sort().join('|');
+
+  const payload = `${text}::img:${rawImages}::vid:${rawVideos}`;
+  const enc = new TextEncoder().encode(payload);
+  const buf = await crypto.subtle.digest('SHA-256', enc);
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+export async function selectEditedMessages(currentMessages, mappings) {
+  const edits = [];
+  for (const msg of currentMessages || []) {
+    if (!msg.hasContent) continue;
+    const mapping = mappings[String(msg.id)];
+    if (!mapping || !mapping.discordMessageId) continue;
+    const currentFp = await fingerprintMessage(msg);
+    if (mapping.fingerprint && mapping.fingerprint !== currentFp) {
+      edits.push({ message: msg, fingerprint: currentFp, mapping });
+    }
+  }
+  return edits;
 }
 
 export function buildEditPayload(msg) {
   const videoUrls = (msg.videos || []).map(v => v.url || v);
   const content = videoUrls.length
     ? buildFallbackContent(msg.text, videoUrls, 'edited media')
-    : (msg.text || '').slice(0, 2000);
+    : (msg.text || '');
   const embeds = (msg.images || []).slice(0, 4).map(url => ({ image: { url } }));
-  return { content, embeds, attachments: [] };
-}
-
-export function buildDiscordMessageUrl(webhookUrl, discordMessageId) {
-  const url = new URL(webhookUrl);
-  url.pathname = `${url.pathname}/messages/${discordMessageId}`;
-  return url.toString();
-}
-
-// Signed Telegram video URLs rotate on every fetch, so fingerprints normalize
-// video URLs to origin+path; image URLs and converted text are stable.
-export function normalizeVideoUrl(url) {
-  try {
-    const u = new URL(url);
-    return `${u.origin}${u.pathname}`;
-  } catch {
-    return url;
-  }
-}
-
-export async function fingerprintMessage(msg) {
-  const data = [
-    msg.text || '',
-    (msg.images || []).map(normalizeVideoUrl).join('|'),
-    (msg.videos || []).map(v => normalizeVideoUrl(v.url || v)).join('|')
-  ].join('\u0000');
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
-  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-// Returns mapped posts whose Telegram-side content changed since last delivery.
-export async function selectEditedMessages(messages, mappings) {
-  const out = [];
-  for (const message of messages) {
-    const mapping = mappings[String(message.id)];
-    if (!mapping || !mapping.fingerprint) continue;
-    const fingerprint = await fingerprintMessage(message);
-    if (fingerprint !== mapping.fingerprint) out.push({ message, fingerprint, mapping });
-  }
-  return out;
-}
-
-export function buildWaitWebhookUrl(webhookUrl) {
-  const url = new URL(webhookUrl);
-  if (!url.searchParams.has('wait')) url.searchParams.set('wait', 'true');
-  return url.toString();
-}
-
-export function healthFromLastRun(lastRun, now = Date.now()) {
-  if (!lastRun || !lastRun.time) return { healthy: false, reason: 'never-ran', ageMs: null };
-  const ageMs = Math.max(0, now - Date.parse(lastRun.time));
-  if (!Number.isFinite(ageMs) || ageMs > HEALTH_STALE_MS) return { healthy: false, reason: 'cron-stale', ageMs };
-  const channels = lastRun.result?.channels || [];
-  const bad = channels.filter(c => c.status !== 'ok');
-  if (lastRun.result?.status === 'error' || bad.length) return { healthy: false, reason: 'channel-errors', ageMs, badChannels: bad.map(c => c.channel) };
-  return { healthy: true, reason: 'ok', ageMs };
+  return {
+    content: content || undefined,
+    embeds,
+    attachments: []
+  };
 }
