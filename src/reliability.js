@@ -7,8 +7,14 @@ export const MAX_MESSAGES_PER_RUN = 25;
 export const MAX_VIDEO_UPLOADS_PER_RUN = 2;
 export const DISCORD_WEBHOOK_MAX_EMBEDS = 10;
 
-export const RUN_LOCK_TTL_SECONDS = 900;
-export const RUN_LOCK_STALE_MS = 600_000;
+// Run-lock sizing: a single-sync cron tick finishes in <60s (25-message cap,
+// 2-video upload cap), so a 120s TTL comfortably outlives any legit run — a
+// live run's lock NEVER expires mid-run. If the isolate is killed, the lock
+// breaks after only 80s (RUN_LOCK_STALE_MS) and self-expires at 120s, so a
+// dead run can never wedge the relay for more than ~2 minutes. (The old
+// 900s TTL / 10min stale-break left the channel frozen for 10+ minutes.)
+export const RUN_LOCK_TTL_SECONDS = 120;
+export const RUN_LOCK_STALE_MS = 80_000;
 // A post that fails this many times in a row is treated as permanently
 // undeliverable (e.g. a video whose signed URL keeps expiring). Rather than
 // wedge the channel cursor on it forever (which would block every later post

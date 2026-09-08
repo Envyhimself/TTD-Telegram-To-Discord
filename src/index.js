@@ -13,6 +13,7 @@ import {
   healthFromLastRun,
   lockShouldSkip,
   MAX_PERMANENT_FAILURES,
+  MAX_RETRY_ATTEMPTS,
   MAX_VIDEO_UPLOADS_PER_RUN,
   nextFailureAction,
   RETRY_BACKOFF_MS,
@@ -75,11 +76,15 @@ async function readJson(kv, key) {
 
 async function runAndRecord(env, source) {
   if (!env.STATE_KV) return syncAllChannels(env);
+  // Short, self-clearing coordinator lock (90s TTL, 80s stale break). It
+  // prevents an overlapping scheduled() + manual /test from posting the same
+  // message twice, but because the TTL is shorter than a real run can never
+  // reach (single sync finishes in <60s), it can never wedge the channel the
+  // way the old 900s TTL + 10min stale break did when a run got killed.
   const lock = await env.STATE_KV.get('SYNC_LOCK');
   if (lockShouldSkip(lock)) {
     await env.STATE_KV.put('CRON_LAST_RUN', JSON.stringify({
-      time: new Date().toISOString(),
-      source,
+      time: new Date().toISOString(), source,
       result: { status: 'ok', skipped: true, message: 'Another sync is in progress.', channels: [] }
     }));
     return { status: 'skipped', reason: 'sync-already-running' };
@@ -87,52 +92,14 @@ async function runAndRecord(env, source) {
   await env.STATE_KV.put('SYNC_LOCK', new Date().toISOString(), { expirationTtl: RUN_LOCK_TTL_SECONDS });
   try {
     if (source === 'cron') {
-      const startTime = Date.now();
-      let lastResult = null;
-      // Fast polling loop: checks every 10 seconds across a 40-second window.
-      // Posts appear almost immediately after being posted on Telegram.
-      // To stay well within Free KV write limits (1,000 writes/day):
-      // only write CRON_LAST_RUN when new messages were delivered or on the final tick.
-      // inProgress=true marks mid-run so /health never reads the in-flight
-      // result as "stale" and triggers a spurious watchdog kick.
+      // A single sync per cron tick. Files-based polls are reliable for the
+      // Free plan (a multi-loop 40s polling window got CPU/wall-clock-killed
+      // mid-loop and left CRON_LAST_RUN stuck on inProgress:true forever).
+      const result = await syncAllChannels(env);
       await env.STATE_KV.put('CRON_LAST_RUN', JSON.stringify({
-        time: new Date().toISOString(), source, inProgress: true,
-        result: { status: 'in-progress', channels: [] }
+        time: new Date().toISOString(), source, inProgress: false, result
       }));
-      let iteration = 0;
-      let prevState = '';
-      while (Date.now() - startTime < 40_000) {
-        iteration++;
-        lastResult = await syncAllChannels(env);
-        const channels = lastResult?.channels || [];
-        const postedCount = channels.reduce((n, c) => n + (c.postedCount || 0), 0);
-        const fallbackCount = channels.reduce((n, c) => n + (c.fallbackIds?.length || 0), 0);
-        const editCount = channels.reduce((n, c) => n + (c.editedIds?.length || 0), 0);
-        const stuck = channels.filter(c => (c.failedIds?.length || 0) > 0).map(c => c.channel).join(',');
-        const permanent = channels.filter(c => (c.permanentIds?.length || 0) > 0).map(c => c.channel).join(',');
-        const stateSig = `${stuck}|${permanent}|${postedCount}|${fallbackCount}|${editCount}`;
-        const isFinal = (Date.now() - startTime >= 35_000);
-
-        // Write only when it matters: first tick (immediate liveness), the
-        // final tick (authoritative result), or when the delivery state
-        // actually changed (new posts, fallbacks, or a channel going stuck
-        // / unstuck). The inProgress marker written before the loop already
-        // keeps /health green for the whole window, so quiet ticks skip the
-        // write entirely — this is what keeps the free KV write budget safe.
-        if (iteration === 1 || isFinal || stateSig !== prevState) {
-          await env.STATE_KV.put('CRON_LAST_RUN', JSON.stringify({
-            time: new Date().toISOString(),
-            source,
-            inProgress: !isFinal,
-            result: lastResult
-          }));
-          prevState = stateSig;
-        }
-
-        if (isFinal) break;
-        await new Promise(r => setTimeout(r, 10_000));
-      }
-      return lastResult;
+      return result;
     } else {
       const result = await syncAllChannels(env);
       await env.STATE_KV.put('CRON_LAST_RUN', JSON.stringify({ time: new Date().toISOString(), source, result }));

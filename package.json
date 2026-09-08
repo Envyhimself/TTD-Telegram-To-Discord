@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "node wizard.js --selftest && node test-reliability.mjs",
+    "test": "node wizard.js --selftest && node test-import-guard.mjs && node test-reliability.mjs",
     "wizard": "node wizard.js"
   },
   "dependencies": {
