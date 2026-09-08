@@ -42,6 +42,56 @@ export function extractVideos(node) {
   return videos.filter((v, i, all) => all.findIndex(x => x.url === v.url) === i);
 }
 
+export function extractAudio(node) {
+  const audios = [];
+  for (const audio of node.querySelectorAll('audio[src]')) {
+    const url = audio.getAttribute('src');
+    if (url) {
+      const isVoice = audio.classList.contains('tgme_widget_message_voice') ||
+                      !!node.querySelector('.tgme_widget_message_voice_player');
+      const duration = node.querySelector('.tgme_widget_message_voice_duration, .tgme_widget_message_audio_duration')?.textContent?.trim() || '';
+      const title = node.querySelector('.tgme_widget_message_audio_title')?.textContent?.trim() || '';
+      const performer = node.querySelector('.tgme_widget_message_audio_performer')?.textContent?.trim() || '';
+      audios.push({ url, isVoice, duration, title, performer });
+    }
+  }
+  return audios;
+}
+
+export function extractDocuments(node) {
+  const docs = [];
+  for (const doc of node.querySelectorAll('.tgme_widget_message_document')) {
+    const title = doc.querySelector('.tgme_widget_message_document_title')?.textContent?.trim() || 'Document';
+    const extra = doc.querySelector('.tgme_widget_message_document_extra')?.textContent?.trim() || '';
+    const linkNode = doc.querySelector('a[href]') || node.querySelector('a.tgme_widget_message_document_wrap');
+    const url = linkNode?.getAttribute('href') || null;
+    docs.push({ title, extra, url });
+  }
+  return docs;
+}
+
+export function extractPoll(node) {
+  const pollNode = node.querySelector('.tgme_widget_message_poll');
+  if (!pollNode) return null;
+  const question = pollNode.querySelector('.tgme_widget_message_poll_question')?.textContent?.trim() || '';
+  const pollType = pollNode.querySelector('.tgme_widget_message_poll_type')?.textContent?.trim() || 'Poll';
+  const options = pollNode.querySelectorAll('.tgme_widget_message_poll_option').map(opt => {
+    const text = opt.querySelector('.tgme_widget_message_poll_option_text')?.textContent?.trim() || opt.textContent.trim();
+    const percent = opt.querySelector('.tgme_widget_message_poll_option_percent')?.textContent?.trim() || '';
+    return percent ? `${text} (${percent})` : text;
+  });
+  return { question, pollType, options };
+}
+
+export function extractForwardedFrom(node) {
+  const fwdNode = node.querySelector('.tgme_widget_message_forwarded_from');
+  if (!fwdNode) return null;
+  const nameNode = fwdNode.querySelector('.tgme_widget_message_forwarded_from_name');
+  const name = nameNode ? nameNode.textContent.trim() : fwdNode.textContent.replace(/^forwarded from\s*/i, '').trim();
+  const href = nameNode?.getAttribute('href') || null;
+  return { name, href };
+}
+
 // Convert Telegram preview HTML into clean Discord markdown.
 // selfHandle: the channel's own handle — self-signature links are dropped.
 export function htmlToDiscord(html, selfHandle = '') {
@@ -109,7 +159,22 @@ export async function fetchChannelMessages(handle) {
     const text = textNode ? htmlToDiscord(textNode.innerHTML || '', handle) : '';
     const images = extractImages(node);
     const videos = extractVideos(node);
-    messages.push({ id, text, images, videos, hasContent: !!(text || images.length || videos.length) });
+    const audios = extractAudio(node);
+    const documents = extractDocuments(node);
+    const poll = extractPoll(node);
+    const forwardedFrom = extractForwardedFrom(node);
+    const hasContent = !!(text || images.length || videos.length || audios.length || documents.length || poll);
+    messages.push({
+      id,
+      text,
+      images,
+      videos,
+      audios,
+      documents,
+      poll,
+      forwardedFrom,
+      hasContent
+    });
   }
   messages.sort((a, b) => a.id - b.id);
   return messages;

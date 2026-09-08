@@ -2,22 +2,26 @@ import { CHANNELS, fetchChannelMessages } from './telegram.js';
 import {
   buildDiscordMessageUrl,
   buildEditPayload,
-  buildFallbackContent,
   buildWaitWebhookUrl,
   classifyVideo,
+  DISCORD_CONTENT_MAX,
+  DISCORD_UPLOAD_SAFE_LIMIT,
+  DISCORD_WEBHOOK_MAX_EMBEDS,
+  EDIT_PACING_MS,
   fingerprintMessage,
+  formatMessageContent,
   healthFromLastRun,
   lockShouldSkip,
   MAX_PERMANENT_FAILURES,
   MAX_VIDEO_UPLOADS_PER_RUN,
   nextFailureAction,
+  RETRY_BACKOFF_MS,
   RUN_LOCK_STALE_MS,
   RUN_LOCK_TTL_SECONDS,
   selectEditedMessages,
-  selectMessageBatch
+  selectMessageBatch,
+  truncateContent
 } from './reliability.js';
-
-const DISCORD_WEBHOOK_MAX_EMBEDS = 4;
 
 export default {
   async scheduled(_event, env, ctx) {
@@ -82,9 +86,58 @@ async function runAndRecord(env, source) {
   }
   await env.STATE_KV.put('SYNC_LOCK', new Date().toISOString(), { expirationTtl: RUN_LOCK_TTL_SECONDS });
   try {
-    const result = await syncAllChannels(env);
-    await env.STATE_KV.put('CRON_LAST_RUN', JSON.stringify({ time: new Date().toISOString(), source, result }));
-    return result;
+    if (source === 'cron') {
+      const startTime = Date.now();
+      let lastResult = null;
+      // Fast polling loop: checks every 10 seconds across a 40-second window.
+      // Posts appear almost immediately after being posted on Telegram.
+      // To stay well within Free KV write limits (1,000 writes/day):
+      // only write CRON_LAST_RUN when new messages were delivered or on the final tick.
+      // inProgress=true marks mid-run so /health never reads the in-flight
+      // result as "stale" and triggers a spurious watchdog kick.
+      await env.STATE_KV.put('CRON_LAST_RUN', JSON.stringify({
+        time: new Date().toISOString(), source, inProgress: true,
+        result: { status: 'in-progress', channels: [] }
+      }));
+      let iteration = 0;
+      let prevState = '';
+      while (Date.now() - startTime < 40_000) {
+        iteration++;
+        lastResult = await syncAllChannels(env);
+        const channels = lastResult?.channels || [];
+        const postedCount = channels.reduce((n, c) => n + (c.postedCount || 0), 0);
+        const fallbackCount = channels.reduce((n, c) => n + (c.fallbackIds?.length || 0), 0);
+        const editCount = channels.reduce((n, c) => n + (c.editedIds?.length || 0), 0);
+        const stuck = channels.filter(c => (c.failedIds?.length || 0) > 0).map(c => c.channel).join(',');
+        const permanent = channels.filter(c => (c.permanentIds?.length || 0) > 0).map(c => c.channel).join(',');
+        const stateSig = `${stuck}|${permanent}|${postedCount}|${fallbackCount}|${editCount}`;
+        const isFinal = (Date.now() - startTime >= 35_000);
+
+        // Write only when it matters: first tick (immediate liveness), the
+        // final tick (authoritative result), or when the delivery state
+        // actually changed (new posts, fallbacks, or a channel going stuck
+        // / unstuck). The inProgress marker written before the loop already
+        // keeps /health green for the whole window, so quiet ticks skip the
+        // write entirely — this is what keeps the free KV write budget safe.
+        if (iteration === 1 || isFinal || stateSig !== prevState) {
+          await env.STATE_KV.put('CRON_LAST_RUN', JSON.stringify({
+            time: new Date().toISOString(),
+            source,
+            inProgress: !isFinal,
+            result: lastResult
+          }));
+          prevState = stateSig;
+        }
+
+        if (isFinal) break;
+        await new Promise(r => setTimeout(r, 10_000));
+      }
+      return lastResult;
+    } else {
+      const result = await syncAllChannels(env);
+      await env.STATE_KV.put('CRON_LAST_RUN', JSON.stringify({ time: new Date().toISOString(), source, result }));
+      return result;
+    }
   } finally {
     await env.STATE_KV.delete('SYNC_LOCK');
   }
@@ -114,7 +167,9 @@ async function loadMappings(kv, handle) {
 }
 
 async function saveMappings(kv, handle, map) {
-  const ids = Object.keys(map).map(Number).sort((a, b) => b - a).slice(0, 300);
+  // 500 = ~500-message history for edit detection; also bounds the
+  // per-run edit-candidate scan (25 new + 500 candidate messages per page).
+  const ids = Object.keys(map).map(Number).sort((a, b) => b - a).slice(0, 500);
   const trimmed = {};
   for (const id of ids) trimmed[id] = map[id];
   await kv.put('msgmap:' + handle, JSON.stringify(trimmed));
@@ -140,6 +195,9 @@ async function syncChannel(channel, env, webhookUrl, videoBudget) {
 
   let cursor = lastSeenId;
   const postedIds = [], fallbackIds = [], skippedIds = [], failedIds = [], editedIds = [], editFailedIds = [];
+  const permanentIds = [];
+  let circuitOpen = false;
+  let consecutive = 0;
 
   for (const msg of newMessages) {
     if (!msg.hasContent) {
@@ -148,21 +206,72 @@ async function syncChannel(channel, env, webhookUrl, videoBudget) {
       continue;
     }
 
+    // Circuit breaker: if Discord-side delivery has failed 5 times recently
+    // for this channel (blanket 429s / outage), stop hammering it for 15
+    // minutes. Keeps the give-up counters from churning during a Discord
+    // incident and keeps CPU flat while the downstream is closed.
+    const breakerKey = 'breaker:' + channel.handle;
+    const breaker = env.STATE_KV ? await readJson(env.STATE_KV, breakerKey) : null;
+    if (breaker && breaker.open && Date.now() - new Date(breaker.open).getTime() < 15 * 60_000) {
+      circuitOpen = true;
+      break;
+    }
+    const channelFailures = env.STATE_KV ? Number(await env.STATE_KV.get('cfails:' + channel.handle) || 0) : 0;
+    const recordChannelFailure = async () => {
+      if (!env.STATE_KV) return;
+      await env.STATE_KV.put('cfails:' + channel.handle, String(channelFailures + 1), { expirationTtl: 600 });
+    };
+
     const failureKey = 'failure:' + channel.handle + ':' + msg.id;
+    // Stuck-post guard: if this exact post was already attempted less than
+    // RETRY_BACKOFF_MS ago (and hasn't reached permanent-give-up yet), don't
+    // hammer it again on this 10s poll — retry it on a later run. Keeps CPU
+    // flat while Discord rate-limits or a media URL keeps expiring.
+    const failures = env.STATE_KV ? Number(await env.STATE_KV.get(failureKey) || 0) : 0;
+    const lastAttempt = env.STATE_KV ? await readJson(env.STATE_KV, 'lastattempt:' + channel.handle + ':' + msg.id) : null;
+    const inBackoff = lastAttempt && Date.now() - new Date(lastAttempt.time).getTime() < RETRY_BACKOFF_MS;
+    if (inBackoff && failures < MAX_PERMANENT_FAILURES - 1) {
+      break;
+    }
+    if (env.STATE_KV) await env.STATE_KV.put('lastattempt:' + channel.handle + ':' + msg.id,
+      JSON.stringify({ time: new Date().toISOString() }), { expirationTtl: 86400 });
+
     let outcome = await postToWebhook(buildWaitWebhookUrl(webhookUrl), channel.name, msg, videoBudget);
 
     if (outcome.status === 'posted') {
       await recordMapping(env.STATE_KV, channel.handle, mappings, msg, outcome.discordMessageId);
-      if (env.STATE_KV) await env.STATE_KV.delete(failureKey);
+      if (env.STATE_KV) {
+        await env.STATE_KV.delete(failureKey);
+        await env.STATE_KV.delete('lastattempt:' + channel.handle + ':' + msg.id);
+        await env.STATE_KV.delete(breakerKey);
+        await env.STATE_KV.delete('cfails:' + channel.handle);
+      }
       cursor = Math.max(cursor, msg.id);
       postedIds.push(msg.id);
+      consecutive = 0;
       continue;
     }
 
-    const failures = env.STATE_KV ? Number(await env.STATE_KV.get(failureKey) || 0) + 1 : 1;
-    if (env.STATE_KV) await env.STATE_KV.put(failureKey, String(failures), { expirationTtl: 86400 });
+    const newFailures = failures + 1;
+    // A Discord-side failure (webhook 429/5xx/network) counts toward the
+    // channel breaker; media/Telegram-side failures do not (a single dead
+    // video URL must not open the breaker).
+    const discordDown = outcome.retryable && /discord/.test(outcome.reason || '');
+    if (discordDown) await recordChannelFailure();
 
-    if (outcome.status === 'fallback' || nextFailureAction(failures) === 'fallback') {
+    // Only NON-retryable failures (413 size, 400 bad payload, dead media URL)
+    // count toward permanent give-up. Retryable failures (429, network,
+    // Discord 5xx) are backed off but never dead-lettered — a Discord outage
+    // must not wedge a channel into skipped messages.
+    const permanent = !outcome.retryable && newFailures >= MAX_PERMANENT_FAILURES;
+    if (env.STATE_KV && !permanent) await env.STATE_KV.put(failureKey, String(newFailures), { expirationTtl: 86400 });
+
+    // Link fallback: immediate for 'fallback' outcomes (oversize media,
+    // batch video budget), or after MAX_RETRY_ATTEMPTS for a post whose
+    // content Discord rejects / whose media URL keeps dying. Retryable
+    // failures (429/network/5xx) are NEVER link-fallbacked while Discord is
+    // down — they simply wait for the backoff and retry on a later run.
+    if (outcome.status === 'fallback' || (!outcome.retryable && newFailures >= MAX_RETRY_ATTEMPTS + 1)) {
       const fb = await postFallback(buildWaitWebhookUrl(webhookUrl), channel.name, msg, outcome.reason);
       if (fb.ok) {
         await recordMapping(env.STATE_KV, channel.handle, mappings, msg, fb.discordMessageId);
@@ -170,30 +279,55 @@ async function syncChannel(channel, env, webhookUrl, videoBudget) {
         fallbackIds.push(msg.id);
         if (env.STATE_KV) {
           await env.STATE_KV.delete(failureKey);
-          await recordDeadLetter(env.STATE_KV, channel.handle, msg.id, outcome.reason, failures);
+          await env.STATE_KV.delete('lastattempt:' + channel.handle + ':' + msg.id);
+          await env.STATE_KV.delete(breakerKey);
+          await env.STATE_KV.delete('cfails:' + channel.handle);
+          await recordDeadLetter(env.STATE_KV, channel.handle, msg.id, outcome.reason, newFailures);
         }
+        consecutive = 0;
         continue;
       }
+      if (fb.rateLimited) await recordChannelFailure();
     }
 
-    if (failures >= MAX_PERMANENT_FAILURES) {
+    if (permanent) {
       // Permanently undeliverable (e.g. a video whose signed URL keeps
-      // expiring, or a Discord rejection). Emitting it again just fails again
-      // and wedges the cursor — which would block EVERY later post in this
-      // channel forever. Record a dead letter, advance past it, and keep the
-      // channel flowing. The next post will reach Discord again.
+      // expiring, or a Discord validation rejection). Emitting it again just
+      // fails again and wedges the cursor — which would block EVERY later
+      // post in this channel forever. Record a dead letter, advance past it,
+      // and keep the channel flowing.
       if (env.STATE_KV) {
         await recordDeadLetter(env.STATE_KV, channel.handle, msg.id,
-          'permanent-giveup:' + (outcome.reason || 'unknown'), failures);
+          'permanent-giveup:' + (outcome.reason || 'unknown'), newFailures);
         await env.STATE_KV.delete(failureKey);
+        await env.STATE_KV.delete('lastattempt:' + channel.handle + ':' + msg.id);
       }
       cursor = Math.max(cursor, msg.id);
-      skippedIds.push(msg.id);
+      permanentIds.push(msg.id);
+      consecutive = 0;
       continue;
     }
 
+    // Failed but not permanently dead: it is retried on a later run once
+    // RETRY_BACKOFF_MS has elapsed. Track consecutive failures for the
+    // circuit breaker, and keep trying LATER posts in this batch — one bad
+    // post must not silence the rest of the channel.
+    consecutive++;
     failedIds.push(msg.id);
-    break;
+    if (consecutive >= 3 || channelFailures + (discordDown ? 1 : 0) >= 5) {
+      // 3 consecutive failures in this run, or 5 Discord-side failures
+      // recently = Discord outage / blanket 429s. Open the circuit breaker
+      // (pause this channel 15 minutes) and stop this run: retrying the rest
+      // would just burn CPU on a downstream that rejects everything.
+      if (env.STATE_KV && !discordDown) {
+        await env.STATE_KV.put('cfails:' + channel.handle, String(channelFailures + consecutive), { expirationTtl: 600 });
+      }
+      if (env.STATE_KV) {
+        await env.STATE_KV.put(breakerKey, JSON.stringify({ open: new Date().toISOString() }), { expirationTtl: 15 * 60 });
+      }
+      circuitOpen = true;
+      break;
+    }
   }
 
   for (const { message, fingerprint, mapping } of await selectEditedMessages(messages, mappings)) {
@@ -203,18 +337,29 @@ async function syncChannel(channel, env, webhookUrl, videoBudget) {
       editedIds.push(message.id);
     } else if (result.status === 'gone') {
       delete mappings[String(message.id)];
+    } else if (result.status === 'rate-limited') {
+      // Discord 429: stop pacing the budget for this run, the remaining
+      // edits will apply on a later run (fingerprints are unchanged).
+      editFailedIds.push(message.id);
+      break;
     } else {
       editFailedIds.push(message.id);
     }
+    await new Promise(r => setTimeout(r, EDIT_PACING_MS));
   }
 
   if (env.STATE_KV && cursor > lastSeenId) await env.STATE_KV.put(kvKey, String(cursor));
-  if (env.STATE_KV) await saveMappings(env.STATE_KV, channel.handle, mappings);
+  // Save mappings only when something changed — the 500-entry map is ~60KB
+  // and rewriting it every 10s poll would burn the free KV write budget.
+  if (env.STATE_KV && (postedIds.length || fallbackIds.length || editedIds.length || editFailedIds.length)) {
+    await saveMappings(env.STATE_KV, channel.handle, mappings);
+  }
   return {
     channel: channel.handle,
     status: failedIds.length || editFailedIds.length ? 'partial' : 'ok',
     postedCount: postedIds.length,
-    postedIds, fallbackIds, skippedIds, failedIds, editedIds, editFailedIds, cursor
+    postedIds, fallbackIds, skippedIds, failedIds, permanentIds, editedIds, editFailedIds, cursor,
+    circuitOpen
   };
 }
 
@@ -228,6 +373,8 @@ function basePayload(channelName, content) {
   return { username: channelName, avatar_url: 'https://telegram.org/img/t_logo.png', content: content || undefined };
 }
 
+
+
 async function discordPostResult(res) {
   if (!res.ok && res.status !== 204) return { status: 'failed', reason: 'discord-http-' + res.status };
   let discordMessageId = null;
@@ -239,12 +386,12 @@ async function discordPostResult(res) {
 
 async function postFallback(webhookUrl, channelName, msg, reason) {
   const videoUrls = (msg.videos || []).map(v => v.url || v);
-  const content = buildFallbackContent(msg.text, videoUrls, reason);
+  let content = truncateContent(formatMessageContent(msg, videoUrls, reason));
   const payload = basePayload(channelName, content);
   const posters = (msg.videos || []).map(v => v.poster).filter(Boolean).slice(0, DISCORD_WEBHOOK_MAX_EMBEDS);
   if (posters.length) payload.embeds = posters.map(url => ({ image: { url } }));
   const res = await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-  if (!res.ok && res.status !== 204) return { ok: false, status: res.status };
+  if (!res.ok && res.status !== 204) return { ok: false, status: res.status, rateLimited: res.status === 429 };
   let discordMessageId = null;
   if (res.status === 200) {
     try { discordMessageId = (await res.json())?.id || null; } catch {}
@@ -259,6 +406,7 @@ async function editDiscordMessage(webhookUrl, discordMessageId, msg) {
     const res = await fetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     if (res.ok) return { status: 'ok' };
     if (res.status === 404) return { status: 'gone' };
+    if (res.status === 429) return { status: 'rate-limited', reason: 'discord-429' };
     return { status: 'failed', reason: 'discord-http-' + res.status };
   } catch {
     return { status: 'failed', reason: 'edit-network-error' };
@@ -266,8 +414,7 @@ async function editDiscordMessage(webhookUrl, discordMessageId, msg) {
 }
 
 async function postToWebhook(webhookUrl, channelName, msg, videoBudget = { remaining: 2 }) {
-  let content = msg.text || '';
-  if (content.length > 2000) content = content.slice(0, 1995) + '...';
+  let content = truncateContent(formatMessageContent(msg));
   const videos = (msg.videos || []).slice(0, 4);
 
   if (videos.length) {
@@ -280,14 +427,15 @@ async function postToWebhook(webhookUrl, channelName, msg, videoBudget = { remai
         const head = await fetch(videos[i].url, { method: 'HEAD', headers: { 'User-Agent': 'Mozilla/5.0' } });
         const length = Number(head.headers.get('content-length'));
         const decision = classifyVideo({ ok: head.ok, status: head.status, length });
-        if (decision.action !== 'upload') return { status: decision.action === 'fallback' ? 'fallback' : 'failed', reason: decision.reason };
+        // oversize -> non-retryable link fallback; bad/unknown -> retryable
+        if (decision.action !== 'upload') return { status: decision.action === 'fallback' ? 'fallback' : 'failed', reason: decision.reason, retryable: decision.action !== 'fallback' };
 
         const vidRes = await fetch(videos[i].url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        if (!vidRes.ok) return { status: 'failed', reason: 'telegram-http-' + vidRes.status };
+        if (!vidRes.ok) return { status: 'failed', reason: 'telegram-http-' + vidRes.status, retryable: true };
         const buf = await vidRes.arrayBuffer();
         files.push(new Blob([buf], { type: 'video/mp4' }));
       } catch (err) {
-        return { status: 'failed', reason: 'video-network-error' };
+        return { status: 'failed', reason: 'video-network-error', retryable: true };
       }
     }
 
@@ -301,10 +449,44 @@ async function postToWebhook(webhookUrl, channelName, msg, videoBudget = { remai
     try {
       const res = await fetch(webhookUrl, { method: 'POST', body: form });
       if (res.ok || res.status === 204) return discordPostResult(res);
-      return { status: res.status === 413 ? 'fallback' : 'failed', reason: 'discord-http-' + res.status };
+      // 413 = definitely too big -> non-retryable link fallback; 429/5xx -> retryable
+      return { status: res.status === 413 ? 'fallback' : 'failed', reason: 'discord-http-' + res.status, retryable: res.status !== 413 };
     } catch {
-      return { status: 'failed', reason: 'discord-network-error' };
+      return { status: 'failed', reason: 'discord-network-error', retryable: true };
     }
+  }
+
+  // Handle voice notes / audio tracks
+  const audios = msg.audios || [];
+  if (audios.length) {
+    const audio = audios[0];
+    try {
+      const audioRes = await fetch(audio.url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      if (audioRes.ok) {
+        const buf = await audioRes.arrayBuffer();
+        if (buf.byteLength <= DISCORD_UPLOAD_SAFE_LIMIT) {
+          const form = new FormData();
+          const ext = audio.isVoice ? 'ogg' : 'mp3';
+          const filename = `${audio.isVoice ? 'voice' : 'audio'}_${msg.id}.${ext}`;
+          form.append('payload_json', JSON.stringify({
+            ...basePayload(channelName, content),
+            attachments: [{ id: 0, filename }]
+          }));
+          form.append('files[0]', new Blob([buf], { type: audio.isVoice ? 'audio/ogg' : 'audio/mpeg' }), filename);
+          const res = await fetch(webhookUrl, { method: 'POST', body: form });
+          if (res.ok || res.status === 204) return discordPostResult(res);
+        }
+      }
+    } catch {
+      // Network/download issue — fallback to link below
+    }
+
+    // Audio upload fallback link
+    const audioLabel = audio.isVoice
+      ? `🎙️ **Voice Message** ${audio.duration ? `(${audio.duration})` : ''}`
+      : `🎵 **Audio**: ${[audio.title, audio.performer].filter(Boolean).join(' - ')} ${audio.duration ? `(${audio.duration})` : ''}`;
+    const audioFallback = `${audioLabel} [▶️ Listen / Download](${audio.url})`;
+    content = truncateContent([content, audioFallback].filter(Boolean).join('\n\n'));
   }
 
   const embeds = (msg.images || []).slice(0, DISCORD_WEBHOOK_MAX_EMBEDS).map(url => ({ image: { url } }));
@@ -313,8 +495,8 @@ async function postToWebhook(webhookUrl, channelName, msg, videoBudget = { remai
   if (embeds.length) payload.embeds = embeds;
   try {
     const res = await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-    return res.ok || res.status === 204 ? await discordPostResult(res) : { status: 'failed', reason: 'discord-http-' + res.status };
+    return res.ok || res.status === 204 ? await discordPostResult(res) : { status: 'failed', reason: 'discord-http-' + res.status, retryable: res.status !== 413 };
   } catch {
-    return { status: 'failed', reason: 'discord-network-error' };
+    return { status: 'failed', reason: 'discord-network-error', retryable: true };
   }
 }

@@ -14,9 +14,10 @@ Runs 24/7 on **Cloudflare Workers** (cron `* * * * *`) with **Cloudflare KV** cu
 - **Direct media uploads**: Downloads real `.mp4` videos (<= 8 MB) and uploads them to Discord as multipart attachments (`files[0]`) instead of posting bare links.
 - **24/7 uptime (v1.1.2)**: A self-healing run lock (15-minute TTL, 10-minute stale break) plus a per-run CPU budget (≤2 video uploads, extras fall back to instant links) guarantee the relay can never wedge on `cron-stale`, even when heavy video batches pile up overnight.
 - **Never-Go-Quiet (v1.1.3)**: A standalone watchdog Worker (`ttd-watchdog`) checks all relays every 5 minutes over service bindings and revives any that stop recording runs via `/wd-kick`. A post that stays undeliverable for 10 consecutive attempts is dead-lettered and skipped so one broken post can never wedge an entire channel's cursor.
-- **Telegram edit synchronization**: When a recently mirrored Telegram post is edited, its mapped Discord message is updated in place on the next one-minute sync. Available for posts first delivered by v1.1.1 or later while they remain visible in Telegram's public preview.
+- **Every post, instantly (v1.1.4)**: Voice notes, audio, polls, documents and forwarded posts are now forwarded too (they were silently skipped before). Cron polls every 10 s for 40 s (≈5–15 s delivery instead of up to 60 s), one bad post can never silence the rest of a channel, retryable failures back off instead of dead-lettering, a 15-minute circuit breaker rides out Discord outages, and a legacy-fingerprint guard stops phantom edit storms on upgrades.
+- **Telegram edit synchronization**: When a recently mirrored Telegram post is edited, its mapped Discord message is updated in place on the next 10-second poll (capped at 25 edits per channel per run). Available for posts first delivered by v1.1.1 or later while they remain visible in Telegram's public preview (last 500 per channel).
 - **Anti-freeze video fallback**: If a video is too large (> 8 MB) or Discord/network rejects the file upload, TTD posts the post text + a direct video download link so newer channel posts never get blocked overnight.
-- **Backlog catch-up protection**: Bounds catch-up batches to 5 messages per run per channel, preventing Cloudflare execution timeout spikes during reconnects.
+- **Backlog catch-up protection**: Bounds catch-up batches to 25 messages per run per channel (v1.1.4; was 5), preventing Cloudflare execution timeout spikes during reconnects.
 - **Cron run-lock**: Prevents overlapping execution between cron runs and manual trigger requests.
 - **Health monitoring**: Built-in `/health` endpoint returning uptime, secret status, last run timestamps, and dead-letter logs.
 - **Clean output**: Strips `t.me` URLs and renders clean text, bold headers, paragraphs, and photos.
@@ -82,7 +83,7 @@ node wizard.js
 
 ## Verification & Monitoring Endpoints
  
-- **Automatic Sync**: Runs every minute via Cloudflare Cron (`* * * * *`).
+- **Automatic Sync**: Fires on the minute via Cloudflare Cron (`* * * * *`), then polls Telegram every 10 s for a 40 s window (v1.1.4) so new posts reach Discord in ~5–15 s instead of up to 60 s.
 - **Health Check**: Open `https://<your-worker>.<subdomain>.workers.dev/health` to view operational status, last run timestamps, and recent dead-letter fallback logs.
 - **Manual Sync**: Open `https://<your-worker>.<subdomain>.workers.dev/test` in your browser or make a GET request to immediately trigger a sync of the latest messages.
 
