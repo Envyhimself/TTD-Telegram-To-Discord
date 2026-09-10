@@ -1,5 +1,9 @@
 # 🦁☀️ TTD: تلگرام به دیسکورد (نسخه فارسی)
 
+<p align="center">
+  <img src="assets/logo.png" alt="لوگوی TTD" width="600">
+</p>
+
 <div dir="rtl">
 
 [🌐 بازگشت به نسخهی انگلیسی](README.md)

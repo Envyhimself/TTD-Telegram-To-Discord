@@ -1,5 +1,9 @@
 # TTD — Telegram to Discord
 
+<p align="center">
+  <img src="assets/logo.png" alt="TTD Logo" width="600">
+</p>
+
 > **Language / زبان:** [🦁☀️ فارسی](README.fa.md) | **English** (below)
 
 Automated, serverless relay that mirrors public Telegram channels to Discord webhooks with clean text formatting, inline images, and real MP4 video attachments.
